@@ -34,6 +34,7 @@ PatternBank& DMXControllerProcessor::currentBank() {
 }
 
 void DMXControllerProcessor::addFixture() {
+    const juce::ScopedLock l(dataLock);
     int nextDmx = 0;
     for (auto& f : fixtures) {
         int end = f.dmxStart + f.numSegments * f.profile().channelsPerSegment;
@@ -45,6 +46,7 @@ void DMXControllerProcessor::addFixture() {
 }
 
 void DMXControllerProcessor::removeFixture(int idx) {
+    const juce::ScopedLock l(dataLock);
     if (fixtures.size() <= 1) return;
     if (idx < 0 || idx >= (int)fixtures.size()) return;
     fixtures.erase(fixtures.begin() + idx);
@@ -174,6 +176,7 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
             // Reset all pattern banks to the first step so the next
             // play starts from the beginning, even if the plugin's
             // internal clock is running from the plugin's own PLAY.
+            const juce::ScopedLock l(dataLock);
             currentStep.store(0);
             for (auto& fix : fixtures)
                 fix.patternBank.currentStep = 0;
@@ -197,6 +200,7 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
     // MIDI Clock (24 ppqn) — only when in MIDI Clock mode
     if (msg.isMidiClock() && src == 1 && isPlaying.load()) {
         midiClockCount_++;
+        const juce::ScopedLock l(dataLock);
         if (auto* pat = currentBank().current()) {
             int clocksPerStep = std::max(1, (int)std::round(24.0 / pat->subdiv));
             if (midiClockCount_ % clocksPerStep == 0) {
@@ -222,6 +226,7 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
             if (autoResetOnStop.load()) {
                 // Full rewind to step 0 on every fixture so the next
                 // play starts from the beginning
+                const juce::ScopedLock l(dataLock);
                 currentStep.store(0);
                 for (auto& fix : fixtures)
                     fix.patternBank.currentStep = 0;
@@ -289,15 +294,19 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
                         blackoutActive.store(!blackoutActive.load());
                     break;
                 case MidiTarget::FillAll:
-                    if (msg.isNoteOn())
+                    if (msg.isNoteOn()) {
+                        const juce::ScopedLock l(dataLock);
                         if (auto* pat = currentBank().current())
                             pat->fillAll({255,255,255});
+                    }
                     break;
                 case MidiTarget::Generate:
                     // Simple: trigger chase with white
-                    if (msg.isNoteOn())
+                    if (msg.isNoteOn()) {
+                        const juce::ScopedLock l(dataLock);
                         if (auto* pat = currentBank().current())
                             *pat = Pattern::chase(pat->numSteps, pat->numSegments, {255,255,255});
+                    }
                     break;
                 case MidiTarget::SceneLoad:
                     if (msg.isNoteOn()) loadScene(m.param);
@@ -337,9 +346,12 @@ bool DMXControllerProcessor::findMappingFor(MidiTarget target, int param, MidiMa
 void DMXControllerProcessor::hiResTimerCallback() {
     if (!isPlaying.load() || clockSource.load() != 0) return;
 
-    advanceStep();
-    computeDmxState();
-    emitDmxDelta(nullptr, 0);
+    {
+        const juce::ScopedLock l(dataLock);
+        advanceStep();
+        computeDmxState();
+        emitDmxDelta(nullptr, 0);
+    }
 
     updateClockTimer();
 }
@@ -529,6 +541,7 @@ std::vector<RGBColor> DMXControllerProcessor::applyCrossfade(const std::vector<R
 // Preview
 // ============================================================================
 void DMXControllerProcessor::pushPreview() {
+    const juce::ScopedLock l(dataLock);
     previewRequested.store(true);
     computeDmxState();
     emitDmxDelta(nullptr, 0);
@@ -545,8 +558,11 @@ void DMXControllerProcessor::startPlayback() {
     isPlaying.store(true);
     if (songModeActive) songPlayer.reset();
 
-    computeDmxState();
-    emitDmxDelta(nullptr, 0);
+    {
+        const juce::ScopedLock l(dataLock);
+        computeDmxState();
+        emitDmxDelta(nullptr, 0);
+    }
 
     if (clockSource.load() == 0) updateClockTimer();
 }
@@ -555,6 +571,7 @@ void DMXControllerProcessor::stopPlayback() {
     stopTimer();
     isPlaying.store(false);
 
+    const juce::ScopedLock l(dataLock);
     // Always zero the DMX output on stop
     std::memset(dmxState_, 0, sizeof(dmxState_));
     emitDmxDelta(nullptr, 0);
@@ -574,6 +591,7 @@ void DMXControllerProcessor::stopPlayback() {
 }
 
 void DMXControllerProcessor::resetPlayback() {
+    const juce::ScopedLock l(dataLock);
     currentStep.store(0);
     currentBank().reset();
     sampleCounter_ = 0.0;
@@ -663,6 +681,7 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
     auto xml = getXmlFromBinary(data, sizeInBytes);
     if (!xml || xml->getTagName() != "DMXControllerState") return;
 
+    const juce::ScopedLock l(dataLock);
     bpm              = xml->getDoubleAttribute("bpm", 120.0);
     clockSource.store(xml->getIntAttribute("clockSource",
                         xml->getBoolAttribute("internalClock", true) ? 0 : 1));
@@ -768,6 +787,7 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
 // Undo / Redo
 // ============================================================================
 void DMXControllerProcessor::snapshot() {
+    const juce::ScopedLock l(dataLock);
     if (activeFixture < 0 || activeFixture >= (int)fixtures.size()) return;
     auto& bank = fixtures[activeFixture].patternBank;
     if (auto* pat = bank.current()) {
@@ -778,6 +798,7 @@ void DMXControllerProcessor::snapshot() {
 }
 
 bool DMXControllerProcessor::undo() {
+    const juce::ScopedLock l(dataLock);
     if (undoStack_.empty()) return false;
     auto entry = undoStack_.back();
     undoStack_.pop_back();
@@ -791,6 +812,7 @@ bool DMXControllerProcessor::undo() {
 }
 
 bool DMXControllerProcessor::redo() {
+    const juce::ScopedLock l(dataLock);
     if (redoStack_.empty()) return false;
     auto entry = redoStack_.back();
     redoStack_.pop_back();
@@ -853,6 +875,7 @@ void DMXControllerProcessor::tapTempo() {
 // Panic blackout — zero all 128 channels, clear blackout flag after
 // ============================================================================
 void DMXControllerProcessor::panicBlackout() {
+    const juce::ScopedLock l(dataLock);
     std::memset(dmxState_, 0, sizeof(dmxState_));
     emitDmxDelta(nullptr, 0);
     blackoutActive.store(true);
@@ -862,6 +885,7 @@ void DMXControllerProcessor::panicBlackout() {
 // Duplicate fixture
 // ============================================================================
 void DMXControllerProcessor::duplicateFixture(int idx) {
+    const juce::ScopedLock l(dataLock);
     if (idx < 0 || idx >= (int)fixtures.size()) return;
     FixtureConfig copy = fixtures[idx];
     // Bump DMX start to the next free block
@@ -915,6 +939,7 @@ juce::String DMXControllerProcessor::serializeFixture(int idx) const {
 bool DMXControllerProcessor::deserializeFixtureInto(int idx, const juce::String& json) {
     juce::var parsed = juce::JSON::parse(json);
     if (!parsed.isObject()) return false;
+    const juce::ScopedLock l(dataLock);
     if (idx < 0 || idx >= (int)fixtures.size()) return false;
 
     auto& fix = fixtures[idx];
@@ -984,6 +1009,7 @@ juce::String DMXControllerProcessor::serializePattern(int fixtureIdx, int patIdx
 bool DMXControllerProcessor::deserializePatternInto(int fixtureIdx, int patIdx, const juce::String& json) {
     juce::var parsed = juce::JSON::parse(json);
     if (!parsed.isObject()) return false;
+    const juce::ScopedLock l(dataLock);
     if (fixtureIdx < 0 || fixtureIdx >= (int)fixtures.size()) return false;
     auto& fix = fixtures[fixtureIdx];
     if (patIdx < 0 || patIdx >= (int)fix.patternBank.patterns.size()) return false;

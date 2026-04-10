@@ -44,6 +44,16 @@ public:
     std::vector<FixtureConfig> fixtures;
     int activeFixture = 0;
     PatternBank& currentBank();
+
+    // Protects mutation / read of `fixtures` and their PatternBanks across
+    // the message thread (UI), audio thread (processBlock), and the
+    // HighResolutionTimer thread. Any UI code that reassigns / resizes a
+    // Pattern, mutates fix.numSegments, fix.profileIndex, or the fixtures
+    // vector itself MUST hold this lock. The consumer paths
+    // (computeDmxState, advanceStep, MIDI clock step, host transport reset)
+    // also acquire it.
+    juce::CriticalSection dataLock;
+
     void addFixture();
     void removeFixture(int idx);
     void duplicateFixture(int idx);

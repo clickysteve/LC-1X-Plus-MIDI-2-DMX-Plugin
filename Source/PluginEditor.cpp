@@ -629,57 +629,73 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     segsSlider.setSliderStyle(Slider::IncDecButtons);
     segsSlider.setTextBoxStyle(Slider::TextBoxLeft, false, 32, 22);
     segsSlider.onValueChange = [this] {
-        auto& fix = proc.fixtures[proc.activeFixture];
         int n = (int)segsSlider.getValue();
-        if (n != fix.numSegments) {
+        {
+            // Take the data lock before touching any pattern — the
+            // HighResolutionTimer and audio thread read these fields
+            // concurrently and reassigning a Pattern (destroying/rebuilding
+            // its grid_ vector) while a reader is mid-access crashes.
+            const juce::ScopedLock l(proc.dataLock);
+            auto& fix = proc.fixtures[proc.activeFixture];
+            if (n == fix.numSegments) return;
             fix.numSegments = n;
             // Resize all patterns in this fixture's bank
             for (auto& pat : fix.patternBank.patterns) {
-                pat.numSegments = n;
-                auto col = std::vector<RGBColor>(n);
-                (void)col;
-                // Rebuild grid preserving existing
+                // Rebuild grid preserving existing contents
                 auto copy = pat;
                 pat = Pattern(copy.name, copy.numSteps, n, copy.subdiv);
                 for (int s = 0; s < copy.numSteps; s++)
                     for (int seg = 0; seg < std::min(n, copy.numSegments); seg++)
                         pat.setColor(s, seg, copy.getColor(s, seg));
             }
-            refreshAll();
         }
+        refreshAll();
     };
 
-    dmxStartSlider.setRange(0, 120, 1);
+    // 1-based in the UI (matches how DMX addresses are talked about on the
+    // fixture hardware and every DMX manual), 0-based in storage.
+    dmxStartSlider.setRange(1, 121, 1);
     dmxStartSlider.setSliderStyle(Slider::IncDecButtons);
     dmxStartSlider.setTextBoxStyle(Slider::TextBoxLeft, false, 40, 22);
     dmxStartSlider.onValueChange = [this] {
-        proc.fixtures[proc.activeFixture].dmxStart = (int)dmxStartSlider.getValue();
+        const juce::ScopedLock l(proc.dataLock);
+        proc.fixtures[proc.activeFixture].dmxStart = (int)dmxStartSlider.getValue() - 1;
     };
 
     for (auto& prof : getFixtureProfiles())
         profileSelector.addItem(prof.name, profileSelector.getNumItems() + 1);
     profileSelector.onChange = [this] {
-        auto& fix = proc.fixtures[proc.activeFixture];
-        fix.profileIndex = profileSelector.getSelectedId() - 1;
+        bool rebuilt = false;
+        int  lockedSegs = 0;
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            auto& fix = proc.fixtures[proc.activeFixture];
+            fix.profileIndex = profileSelector.getSelectedId() - 1;
 
-        // Some profiles lock the segment count (e.g. single-segment Par Can).
-        const auto& prof = fix.profile();
-        if (prof.fixedSegments > 0 && fix.numSegments != prof.fixedSegments) {
-            fix.numSegments = prof.fixedSegments;
-            // Rebuild every pattern to the new segment count
-            for (auto& pat : fix.patternBank.patterns) {
-                auto copy = pat;
-                pat = Pattern(copy.name, copy.numSteps, prof.fixedSegments, copy.subdiv);
-                for (int s = 0; s < copy.numSteps; s++)
-                    for (int seg = 0; seg < std::min(prof.fixedSegments, copy.numSegments); seg++)
-                        pat.setColor(s, seg, copy.getColor(s, seg));
+            // Some profiles lock the segment count (e.g. single-segment Par Can).
+            const auto& prof = fix.profile();
+            lockedSegs = prof.fixedSegments;
+            if (prof.fixedSegments > 0 && fix.numSegments != prof.fixedSegments) {
+                fix.numSegments = prof.fixedSegments;
+                // Rebuild every pattern to the new segment count
+                for (auto& pat : fix.patternBank.patterns) {
+                    auto copy = pat;
+                    pat = Pattern(copy.name, copy.numSteps, prof.fixedSegments, copy.subdiv);
+                    for (int s = 0; s < copy.numSteps; s++)
+                        for (int seg = 0; seg < std::min(prof.fixedSegments, copy.numSegments); seg++)
+                            pat.setColor(s, seg, copy.getColor(s, seg));
+                }
+                rebuilt = true;
             }
+        }
+
+        if (rebuilt) {
             applyFixtureEdit();   // re-sync segsSlider
             refreshAll();
         }
 
         // Disable the segs slider while the profile dictates segments.
-        segsSlider.setEnabled(prof.fixedSegments == 0);
+        segsSlider.setEnabled(lockedSegs == 0);
     };
 
     // ========== Row 3: Bar Preview ==========
@@ -1461,7 +1477,7 @@ void DMXControllerEditor::refreshMidiDeviceList() {
 void DMXControllerEditor::applyFixtureEdit() {
     auto& fix = proc.fixtures[proc.activeFixture];
     segsSlider    .setValue(fix.numSegments, dontSendNotification);
-    dmxStartSlider.setValue(fix.dmxStart,    dontSendNotification);
+    dmxStartSlider.setValue(fix.dmxStart + 1, dontSendNotification);  // UI is 1-based
     profileSelector.setSelectedId(fix.profileIndex + 1, dontSendNotification);
     fixBrightSlider.setValue(fix.brightnessOffset, dontSendNotification);
     segsSlider.setEnabled(fix.profile().fixedSegments == 0);

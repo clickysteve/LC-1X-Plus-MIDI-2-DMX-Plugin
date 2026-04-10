@@ -80,6 +80,16 @@ struct FixtureConfig {
             auto c = colors[seg];
             int base = seg * prof.channelsPerSegment;
 
+            // Effective brightness for the master-dimmer channel. On a par
+            // can (or any fixture with a master dim) we want the dim channel
+            // to track the colour intensity so:
+            //  (a) setting the colour to black actually turns the fixture
+            //      off via the dim channel, and
+            //  (b) the global master dimmer & per-fixture brightness trim
+            //      that `applyTrim` bakes into the RGB values also show up
+            //      on the dim channel, instead of the dim sitting at 100%.
+            const int dimValue = std::max({c.r, c.g, c.b});
+
             for (int ch = 0; ch < (int)prof.channelLayout.size(); ch++) {
                 int offset = base + ch;
                 switch (prof.channelLayout[ch]) {
@@ -87,11 +97,15 @@ struct FixtureConfig {
                     case 'g': result.push_back({offset, c.g}); break;
                     case 'b': result.push_back({offset, c.b}); break;
                     case 'w': result.push_back({offset, std::min({c.r, c.g, c.b})}); break;
-                    case 'd': result.push_back({offset, 255}); break;
+                    case 'd': result.push_back({offset, dimValue}); break;
                 }
             }
         }
 
+        // Extra channels (strobe / mode / speed / etc) are placed at absolute
+        // offsets relative to dmxStart. Applied LAST so that if a user
+        // configures a single-segment fixture whose layout spans more
+        // channels than `channelsPerSegment`, the extras still take effect.
         for (auto& [off, val] : prof.extraChannels)
             result.push_back({off, val});
 
