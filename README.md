@@ -5,7 +5,9 @@
 By Stephen McLeod (aka [allmyfriendsaresynths](https://www.youtube.com/c/allmyfriendsaresynths))
 
 **Version:** 1.0 Beta
-**Formats:** AU, VST3, Standalone (macOS — Universal Binary: Apple Silicon + Intel)
+**Format:** Audio Unit MIDI FX Component (`.component`) — macOS Universal Binary (Apple Silicon + Intel)
+
+> **Disclaimer:** This is an **unofficial** plugin. It is **not affiliated with, endorsed by, or supported by BoomLights**. The LC-1X+ hardware is their product; this plugin is an independent fan project designed to make it more fun to use inside a DAW.
 
 ![LC-1X+ MIDI2DMX plugin UI](LC1XPLUSPLUGIN.png)
 

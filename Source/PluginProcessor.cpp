@@ -480,42 +480,39 @@ void DMXControllerProcessor::computeDmxState() {
     };
 
     for (auto& fixture : fixtures) {
-        auto* pat = fixture.patternBank.current();
-        if (!pat) continue;
-
         std::vector<RGBColor> colors;
         if (flood) {
-            colors.assign(fixture.numSegments, floodCol);
+            // FLOOD is an ALL-fixtures override. Every fixture in the rig
+            // gets the flood colour, mapped through its OWN channel layout
+            // (mapColorsToDmx honours {d,r,g,b} par cans, RGBW fixtures,
+            // etc.), so mixed rigs flood correctly across differing
+            // channel offsets.
+            colors.assign(std::max(1, fixture.numSegments), floodCol);
         } else {
+            auto* pat = fixture.patternBank.current();
+            if (!pat) continue;      // normal playback still needs a pattern
             colors = pat->getStepColors(step);
             colors = applyCrossfade(colors);
         }
 
-        // Apply hue shift (skipped for flood so the chosen colour stays exact),
-        // then master + per-fixture brightness
+        // Apply hue shift (skipped for flood so the chosen colour stays
+        // exact), then master + per-fixture brightness
         float trim = master * fixture.brightnessOffset;
         for (auto& c : colors) {
             if (!flood) c = applyHueSat(c, hue, 1.0f);
             c = applyTrim(c, trim);
         }
 
-        const auto& prof = fixture.profile();
-        if (prof.channelsPerSegment == 3 && !prof.hasMasterDim) {
-            for (int seg = 0; seg < (int)colors.size(); seg++) {
-                int base = fixture.dmxStart + seg * 3;
-                if (base + 2 < 128) {
-                    dmxState_[base]     = colors[seg].r;
-                    dmxState_[base + 1] = colors[seg].g;
-                    dmxState_[base + 2] = colors[seg].b;
-                }
-            }
-        } else {
-            auto pairs = fixture.mapColorsToDmx(colors);
-            for (auto& [off, val] : pairs) {
-                int ch = fixture.dmxStart + off;
-                if (ch >= 0 && ch < 128)
-                    dmxState_[ch] = std::clamp(val, 0, 255);
-            }
+        // Always route through the fixture's profile so each fixture flood
+        // lands on the correct DMX channels. (Previously there was a 3ch
+        // fast path here that assumed a {r,g,b} layout — removed so a
+        // flood on any layout, including dim-channel par cans, is
+        // guaranteed to target the right channels.)
+        auto pairs = fixture.mapColorsToDmx(colors);
+        for (auto& [off, val] : pairs) {
+            int ch = fixture.dmxStart + off;
+            if (ch >= 0 && ch < 128)
+                dmxState_[ch] = (uint8_t)std::clamp(val, 0, 255);
         }
     }
 }
