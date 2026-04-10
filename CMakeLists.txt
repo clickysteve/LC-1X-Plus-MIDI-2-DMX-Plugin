@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(DMXLightController VERSION 1.0.0 LANGUAGES CXX)
+project(DMXLightController VERSION 1.0.0 LANGUAGES C CXX)
 
 # ---------- macOS universal binary (Intel + Apple Silicon) ----------
 if(APPLE)
