@@ -751,6 +751,12 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
             fix.numSegments  = f->getIntAttribute("segments", 8);
             fix.dmxStart     = f->getIntAttribute("dmxStart", 0);
             fix.profileIndex = f->getIntAttribute("profile", 0);
+            // Clamp against current profile list so old saves that
+            // referenced removed profiles (e.g. Dimmer+RGB / RGBW) fall
+            // back to the first profile instead of dangling.
+            if (fix.profileIndex < 0
+                || fix.profileIndex >= (int)getFixtureProfiles().size())
+                fix.profileIndex = 0;
             fix.brightnessOffset = (float)f->getDoubleAttribute("brightOff", 1.0);
 
             if (auto* patsXml = f->getChildByName("Patterns")) {
@@ -991,6 +997,9 @@ bool DMXControllerProcessor::deserializeFixtureInto(int idx, const juce::String&
     fix.numSegments  = (int)parsed.getProperty("segments", 8);
     fix.dmxStart     = (int)parsed.getProperty("dmxStart", 0);
     fix.profileIndex = (int)parsed.getProperty("profile",  0);
+    if (fix.profileIndex < 0
+        || fix.profileIndex >= (int)getFixtureProfiles().size())
+        fix.profileIndex = 0;
     fix.brightnessOffset = (float)(double)parsed.getProperty("brightOff", 1.0);
 
     fix.patternBank.patterns.clear();

@@ -74,13 +74,16 @@ public:
     // 2 = Last Step (reset currentStep to numSteps-1 on stop; first MIDI
     //     clock tick after start wraps cleanly back to step 0, which
     //     avoids the "first step is skipped" problem on clock start).
-    std::atomic<int>  autoResetMode  {0};
+    // Default = Last Step so new instances behave correctly with MIDI
+    // clock out of the box (no "first step skipped" surprise).
+    std::atomic<int>  autoResetMode  {2};
     std::atomic<int>  currentStep    {0};
     std::atomic<bool> needsInitialSend{false};
     double bpm = 120.0;
 
-    // Clock source: 0=Internal, 1=MIDI Clock
-    std::atomic<int>  clockSource{0};
+    // Clock source: 0=Internal, 1=MIDI Clock.
+    // Default = MIDI Clock since that's the intended use on a MIDI track.
+    std::atomic<int>  clockSource{1};
 
     // ==== Live global controls ====
     std::atomic<float> masterDimmer {1.0f};   // 0..1

@@ -32,20 +32,6 @@ inline const std::vector<FixtureProfile>& getFixtureProfiles() {
             0
         },
         {
-            "Dimmer+RGB (4ch)",
-            {'d', 'r', 'g', 'b'}, {},
-            true, 4, 0,
-            "Dimmer + RGB — 4 channels per segment",
-            0
-        },
-        {
-            "RGBW (4ch per segment)",
-            {'r', 'g', 'b', 'w'}, {},
-            false, 4, 0,
-            "RGBW — 4 channels per segment",
-            0
-        },
-        {
             "76W RGB Par Can (4ch)",
             {'d', 'r', 'g', 'b'},       // ch1=dim (hardcoded max), ch2-4=RGB
             {},                         // no extra channels — strobe/mode/speed unused
@@ -74,7 +60,16 @@ struct FixtureConfig {
                   int segs = 8, int start = 0, int profile = 0)
         : name(n), numSegments(segs), dmxStart(start), profileIndex(profile) {}
 
-    const FixtureProfile& profile() const { return getFixtureProfiles()[profileIndex]; }
+    const FixtureProfile& profile() const {
+        // Clamp to a valid index so that state files saved against older
+        // profile lists (which may have referenced profiles that have
+        // since been removed, e.g. the old Dimmer+RGB and RGBW entries)
+        // fall back safely to the first profile instead of crashing.
+        const auto& all = getFixtureProfiles();
+        int idx = profileIndex;
+        if (idx < 0 || idx >= (int)all.size()) idx = 0;
+        return all[idx];
+    }
 
     /// Map a vector of segment RGB colours → list of (relative DMX offset, value) pairs
     std::vector<std::pair<int,int>> mapColorsToDmx(const std::vector<RGBColor>& colors) const {
