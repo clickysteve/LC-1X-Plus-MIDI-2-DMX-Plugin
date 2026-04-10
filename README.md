@@ -7,7 +7,7 @@ By Stephen McLeod (aka [allmyfriendsaresynths](https://www.youtube.com/c/allmyfr
 **Version:** 1.0 Beta
 **Formats:** AU, VST3, Standalone (macOS — Universal Binary: Apple Silicon + Intel)
 
-![LC-1X+ MIDI2DMX plugin UI](docs/screenshot.png)
+![LC-1X+ MIDI2DMX plugin UI](LC1XPLUSPLUGIN.png)
 
 ---
 
