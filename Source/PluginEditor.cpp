@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "UserProfileStore.h"
 
 using namespace juce;
 
@@ -129,6 +130,23 @@ void GridComponent::paint(Graphics& g) {
                 c = rotateHue(c, hueDeg);
             }
 
+            // Grid-visualisation-only brightness floor. The scroll-wheel
+            // dim handler floors at ~DMX 8 so you can always scroll back
+            // up, and the hardware will dutifully output a dim colour —
+            // but on the editor canvas, DMX 8 is indistinguishable from
+            // "empty cell" against the dark background. Boost the
+            // displayed colour so any cell with any light in it is
+            // clearly visible. This does NOT affect DMX output.
+            if (!blackout) {
+                const int cpeak = std::max({c.r, c.g, c.b});
+                if (cpeak > 0 && cpeak < 80) {
+                    const float bump = 80.0f / (float)cpeak;
+                    c.r = (uint8_t)std::clamp((int)std::round(c.r * bump), 0, 255);
+                    c.g = (uint8_t)std::clamp((int)std::round(c.g * bump), 0, 255);
+                    c.b = (uint8_t)std::clamp((int)std::round(c.b * bump), 0, 255);
+                }
+            }
+
             g.setColour(Colour(c.r, c.g, c.b));
             g.fillRect(x + 1.0f, y + 1.0f, cellW - 2.0f, cellH - 2.0f);
 
@@ -197,9 +215,15 @@ void GridComponent::applyColor(int step, int seg) {
         pat->setColor(step, seg, {0, 0, 0});
     } else {
         RGBColor c = activeColor;
-        c.r = (uint8_t)std::clamp((int)(c.r * brightness), 0, 255);
-        c.g = (uint8_t)std::clamp((int)(c.g * brightness), 0, 255);
-        c.b = (uint8_t)std::clamp((int)(c.b * brightness), 0, 255);
+        // The palette brightness slider is 0..1 in perceptual space, but
+        // the actual RGB scaling has to happen in linear (DMX) space —
+        // the LED is roughly linear in PWM duty cycle while the eye is
+        // ~gamma 2.2. Without this conversion the slider barely looks
+        // like it's doing anything across the top half of its travel.
+        const float linear = std::pow(std::clamp(brightness, 0.0f, 1.0f), 2.2f);
+        c.r = (uint8_t)std::clamp((int)std::round(c.r * linear), 0, 255);
+        c.g = (uint8_t)std::clamp((int)std::round(c.g * linear), 0, 255);
+        c.b = (uint8_t)std::clamp((int)std::round(c.b * linear), 0, 255);
         pat->setColor(step, seg, c);
     }
     repaint();
@@ -269,19 +293,60 @@ void GridComponent::mouseWheelMove(const MouseEvent& e, const MouseWheelDetails&
     auto* pat = proc.currentBank().current();
     if (!pat) return;
 
+    // Accumulate wheel delta and only emit a brightness step once the
+    // accumulator crosses a small threshold. This unifies notched mouse
+    // wheels (one big deltaY per notch) and trackpad smooth-scroll (many
+    // tiny deltaYs per flick): both end up producing roughly the same
+    // perceived rate of brightness change, and a single aggressive flick
+    // can't blow a cell straight to black.
+    scrollAccum_ += w.deltaY;
+    constexpr float threshold = 0.08f;    // ≈ one mouse-wheel notch
+    if (std::abs(scrollAccum_) < threshold) return;
+
+    const float stepDelta = scrollAccum_;
+    scrollAccum_ = 0.0f;
+
     auto c = pat->getColor(step, seg);
+    // Black cells have no hue to scale — the erase tool made them black,
+    // so use the paint tool to bring them back. We also avoid driving a
+    // colored cell *to* black via scroll (see min-perceptual clamp below).
     if (c.isBlack()) return;
 
     float peak = (float)std::max({c.r, c.g, c.b});
-    if (peak == 0) return;
-    // Scroll-up gesture = brighter. JUCE deltaY was the wrong way round on
-    // the user's setup, so invert it here.
-    float scale = std::clamp(peak - w.deltaY * 30.0f, 0.0f, 255.0f) / peak;
-    c.r = (uint8_t)std::clamp((int)(c.r * scale), 0, 255);
-    c.g = (uint8_t)std::clamp((int)(c.g * scale), 0, 255);
-    c.b = (uint8_t)std::clamp((int)(c.b * scale), 0, 255);
+    if (peak <= 0.0f) return;
+
+    // Work in perceptual (gamma-corrected) space so each accumulated
+    // wheel-step feels like a uniform brightness change. LEDs are ~linear
+    // in PWM duty cycle but human vision is ~gamma 2.2 — a linear DMX
+    // scroll barely looks dimmer across the top half of the range.
+    constexpr float gamma = 2.2f;
+    float perceptual = std::pow(peak / 255.0f, 1.0f / gamma);      // 0..1
+
+    // Sign preserved from the old code: on Steve's setup, scroll-up
+    // yields negative deltaY = brighter. A multiplier of ~1.2 over the
+    // 0.08 threshold gives ~10% perceptual change per emitted step,
+    // which is roughly 10 steps from full to the dim floor.
+    perceptual -= stepDelta * 1.2f;
+
+    // Floor the scroll-down at a perceptual level that still produces a
+    // visible DMX value (≈DMX 15). This prevents scroll gestures from
+    // trapping cells at pure black where isBlack() would early-return
+    // and the user couldn't bring them back without repainting.
+    perceptual = std::clamp(perceptual, 0.22f, 1.0f);
+
+    const float newPeak = std::pow(perceptual, gamma) * 255.0f;
+    const float scale   = newPeak / peak;
+
+    c.r = (uint8_t)std::clamp((int)std::round(c.r * scale), 0, 255);
+    c.g = (uint8_t)std::clamp((int)std::round(c.g * scale), 0, 255);
+    c.b = (uint8_t)std::clamp((int)std::round(c.b * scale), 0, 255);
     pat->setColor(step, seg, c);
     repaint();
+
+    // If we just edited the currently-playing step, push a live preview
+    // so the hardware updates in real time (matches applyColor()).
+    if (step == proc.currentStep.load())
+        proc.pushPreview();
 }
 
 // ############################################################################
@@ -361,8 +426,10 @@ void SongTimelineComponent::paint(Graphics& g) {
     g.fillAll(Theme::BG_SECONDARY);
 
     auto& song = proc.song;
-    int totalW = std::max((int)song.blocks.size() * kBlockW + 20, getWidth());
-    setSize(totalW, getHeight());
+    // Content size is driven by the editor (see updateSongTimelineSize).
+    // We deliberately do NOT call setSize from paint - calling it here
+    // can recurse into more paints and made the layout fragile when the
+    // timeline was placed inside a Viewport.
 
     for (int i = 0; i < (int)song.blocks.size(); i++) {
         auto& blk = song.blocks[i];
@@ -483,7 +550,13 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     bpmSlider.setValue(proc.bpm);
     bpmSlider.setTextBoxStyle(Slider::TextBoxLeft, false, 50, 20);
     bpmSlider.setSliderStyle(Slider::LinearHorizontal);
-    bpmSlider.onValueChange = [this] { proc.bpm = bpmSlider.getValue(); };
+    bpmSlider.onValueChange = [this] {
+        // Don't let the host-tempo mirror in MIDI Clock mode clobber
+        // proc.bpm — that value is the "internal" tempo and should
+        // survive a round-trip through MIDI Clock mode unchanged.
+        if (proc.clockSource.load() != 1)
+            proc.bpm = bpmSlider.getValue();
+    };
     bpmLabel.setText("BPM", dontSendNotification);
 
     addAndMakeVisible(clockSrcLabel);
@@ -493,11 +566,41 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     // Clamp any legacy saved state of "Sync DAW" (=2) back to Internal.
     if (proc.clockSource.load() >= 2) proc.clockSource.store(0);
     clockSrcSelector.setSelectedId(proc.clockSource.load() + 1, dontSendNotification);
+
+    // Apply initial BPM-slider state based on current clock source. This
+    // mirrors what the clockSrcSelector.onChange lambda does and guarantees
+    // the slider is in a known-good state on editor open regardless of the
+    // saved clockSource value. This is the ONLY place other than the
+    // clockSrcSelector.onChange that touches bpmSlider's enabled/alpha —
+    // the 30 Hz timer must never touch it or it will fight with the user's
+    // mouse drags.
+    {
+        const bool midiClock = proc.clockSource.load() == 1;
+        bpmSlider.setEnabled(true);
+        bpmSlider.setAlpha(midiClock ? 0.4f : 1.0f);
+        bpmSlider.setInterceptsMouseClicks(true, true);
+        tapBtn.setEnabled(!midiClock);
+        tapBtn.setAlpha(midiClock ? 0.4f : 1.0f);
+    }
+
     clockSrcSelector.onChange = [this] {
         int v = clockSrcSelector.getSelectedId() - 1;
         proc.stopPlayback();
         proc.clockSource.store(v);
         playBtn.setButtonText("PLAY");
+
+        // Apply BPM-slider visual state immediately on change. We do this
+        // here (on the message thread, in response to a user action) rather
+        // than in the timer so we never interrupt a live mouse drag.
+        const bool midiClock = v == 1;
+        bpmSlider.setEnabled(true);       // always enabled: setEnabled(false)
+                                          // suppresses setValue() repaints
+                                          // which would break the MIDI Clock
+                                          // host-tempo mirror.
+        bpmSlider.setAlpha(midiClock ? 0.4f : 1.0f);
+        bpmSlider.setInterceptsMouseClicks(true, true);
+        tapBtn.setEnabled(!midiClock);
+        tapBtn.setAlpha(midiClock ? 0.4f : 1.0f);
     };
 
     // ========== Row 2: MIDI In/Out ==========
@@ -673,8 +776,21 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         proc.fixtures[proc.activeFixture].dmxStart = (int)dmxStartSlider.getValue() - 1;
     };
 
-    for (auto& prof : getFixtureProfiles())
-        profileSelector.addItem(prof.name, profileSelector.getNumItems() + 1);
+    refreshProfileSelector();
+
+    addAndMakeVisible(newProfileBtn);
+    addAndMakeVisible(delProfileBtn);
+    // Short labels so the two buttons fit next to the profile selector on
+    // every window width. Hover tooltips explain what they do.
+    newProfileBtn.setButtonText("+");
+    delProfileBtn.setButtonText("-");
+    newProfileBtn.setTooltip("Create a new custom fixture profile "
+                             "(persisted across sessions).");
+    delProfileBtn.setTooltip("Delete the currently selected user profile. "
+                             "Built-in profiles cannot be deleted.");
+    newProfileBtn.onClick = [this] { showNewProfileDialog(); };
+    delProfileBtn.onClick = [this] { confirmAndDeleteCurrentUserProfile(); };
+
     profileSelector.onChange = [this] {
         bool rebuilt = false;
         int  lockedSegs = 0;
@@ -1112,23 +1228,41 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     addAndMakeVisible(dupBlockBtn);
     addAndMakeVisible(repPlusBtn);
     addAndMakeVisible(repMinusBtn);
-    addAndMakeVisible(songTimeline);
+    // Song timeline lives inside a viewport so it can scroll horizontally
+    // and we can auto-follow the currently playing block during song
+    // playback. The timeline component sizes itself (see
+    // updateSongTimelineSize()) to fit N blocks; the viewport handles
+    // the scrolling.
+    songViewport.setViewedComponent(&songTimeline, false);
+    songViewport.setScrollBarsShown(false, true);  // horizontal only
+    addAndMakeVisible(songViewport);
+
+    addAndMakeVisible(songFollowBtn);
+    songFollowBtn.setClickingTogglesState(true);
+    songFollowBtn.setToggleState(true, dontSendNotification);
+    songFollowBtn.setTooltip(
+        "Auto-scroll the song timeline to keep the currently playing "
+        "block in view during song-mode playback. Turn off if you want "
+        "to scroll/edit the song manually while it's running.");
 
     songModeBtn.onClick = [this] { proc.songModeActive = songModeBtn.getToggleState(); };
     addBlockBtn.onClick = [this] {
         proc.song.addBlock(proc.currentBank().currentIndex);
+        updateSongTimelineSize();
         songTimeline.repaint();
     };
     remBlockBtn.onClick = [this] {
         if (songTimeline.selectedBlock >= 0) {
             proc.song.removeBlock(songTimeline.selectedBlock);
             songTimeline.selectedBlock = -1;
+            updateSongTimelineSize();
             songTimeline.repaint();
         }
     };
     dupBlockBtn.onClick = [this] {
         if (songTimeline.selectedBlock >= 0) {
             proc.song.duplicateBlock(songTimeline.selectedBlock);
+            updateSongTimelineSize();
             songTimeline.repaint();
         }
     };
@@ -1211,15 +1345,17 @@ void DMXControllerEditor::resized() {
         addFixBtn      .setBounds(row.removeFromLeft(24));  row.removeFromLeft(2);
         delFixBtn      .setBounds(row.removeFromLeft(24));  row.removeFromLeft(2);
         dupFixBtn      .setBounds(row.removeFromLeft(40));  row.removeFromLeft(2);
-        renameFixBtn   .setBounds(row.removeFromLeft(66));  row.removeFromLeft(2);
-        exportFixBtn   .setBounds(row.removeFromLeft(60));  row.removeFromLeft(2);
-        importFixBtn   .setBounds(row.removeFromLeft(60));  row.removeFromLeft(10);
+        renameFixBtn   .setBounds(row.removeFromLeft(58));  row.removeFromLeft(2);
+        exportFixBtn   .setBounds(row.removeFromLeft(50));  row.removeFromLeft(2);
+        importFixBtn   .setBounds(row.removeFromLeft(50));  row.removeFromLeft(8);
 
         segsLabel_    .setBounds(row.removeFromLeft(28));
         segsSlider    .setBounds(row.removeFromLeft(80)); row.removeFromLeft(gap);
         dmxStartLabel .setBounds(row.removeFromLeft(48));
         dmxStartSlider.setBounds(row.removeFromLeft(90)); row.removeFromLeft(gap);
-        profileSelector.setBounds(row.removeFromLeft(170));
+        profileSelector.setBounds(row.removeFromLeft(150)); row.removeFromLeft(2);
+        newProfileBtn .setBounds(row.removeFromLeft(22));   row.removeFromLeft(2);
+        delProfileBtn .setBounds(row.removeFromLeft(22));
     }
     area.removeFromTop(gap);
 
@@ -1306,26 +1442,28 @@ void DMXControllerEditor::resized() {
         scenesLabel.setBounds(row.removeFromRight(60));
         row.removeFromRight(10);
 
-        patternSelector.setBounds(row.removeFromLeft(140)); row.removeFromLeft(gap);
-        newPatBtn      .setBounds(row.removeFromLeft(28));  row.removeFromLeft(2);
-        dupPatBtn      .setBounds(row.removeFromLeft(50));  row.removeFromLeft(2);
-        delPatBtn      .setBounds(row.removeFromLeft(46));  row.removeFromLeft(2);
-        patMoreBtn     .setBounds(row.removeFromLeft(32));  row.removeFromLeft(gap);
+        patternSelector.setBounds(row.removeFromLeft(128)); row.removeFromLeft(gap);
+        newPatBtn      .setBounds(row.removeFromLeft(24));  row.removeFromLeft(2);
+        dupPatBtn      .setBounds(row.removeFromLeft(44));  row.removeFromLeft(2);
+        delPatBtn      .setBounds(row.removeFromLeft(40));  row.removeFromLeft(2);
+        patMoreBtn     .setBounds(row.removeFromLeft(28));  row.removeFromLeft(gap);
 
-        row.removeFromLeft(10);
-        stepsMinBtn  .setBounds(row.removeFromLeft(24)); row.removeFromLeft(2);
-        stepsLabel   .setBounds(row.removeFromLeft(60)); row.removeFromLeft(2);
-        stepsPlusBtn .setBounds(row.removeFromLeft(24)); row.removeFromLeft(gap);
-        subdivSelector.setBounds(row.removeFromLeft(64)); row.removeFromLeft(gap);
+        row.removeFromLeft(6);
+        stepsMinBtn  .setBounds(row.removeFromLeft(22)); row.removeFromLeft(2);
+        stepsLabel   .setBounds(row.removeFromLeft(62)); row.removeFromLeft(2);
+        stepsPlusBtn .setBounds(row.removeFromLeft(22)); row.removeFromLeft(gap);
+        subdivSelector.setBounds(row.removeFromLeft(68)); row.removeFromLeft(gap);
 
-        songModeBtn .setBounds(row.removeFromLeft(60)); row.removeFromLeft(gap);
-        addBlockBtn .setBounds(row.removeFromLeft(56)); row.removeFromLeft(gap);
-        remBlockBtn .setBounds(row.removeFromLeft(56)); row.removeFromLeft(gap);
-        dupBlockBtn .setBounds(row.removeFromLeft(60));
+        songModeBtn  .setBounds(row.removeFromLeft(58)); row.removeFromLeft(gap);
+        addBlockBtn  .setBounds(row.removeFromLeft(62)); row.removeFromLeft(gap);
+        remBlockBtn  .setBounds(row.removeFromLeft(60)); row.removeFromLeft(gap);
+        dupBlockBtn  .setBounds(row.removeFromLeft(64)); row.removeFromLeft(gap);
+        songFollowBtn.setBounds(row.removeFromLeft(76));
     }
     bottomArea.removeFromTop(gap);
 
-    songTimeline.setBounds(bottomArea);
+    songViewport.setBounds(bottomArea);
+    updateSongTimelineSize();
 
     // Main area: grid viewport
     area.removeFromBottom(gap);
@@ -1383,8 +1521,39 @@ void DMXControllerEditor::timerCallback() {
     playBtn.setColour(TextButton::buttonColourId,
         playing ? Theme::ACCENT.darker(0.3f) : Theme::GREEN_ACCENT.darker(0.3f));
 
-    if (std::abs(bpmSlider.getValue() - proc.bpm) > 0.5)
-        bpmSlider.setValue(proc.bpm, dontSendNotification);
+    // BPM display:
+    //  - Internal clock: the timer MUST NOT touch bpmSlider at all.
+    //    setAlpha / setEnabled / setValue during a live mouse drag
+    //    interrupts the slider's drag handling and makes it feel
+    //    unresponsive. All enable/alpha state is applied in
+    //    clockSrcSelector.onChange (user action, message thread) instead.
+    //  - MIDI Clock: mirror the host tempo every tick. The slider stays
+    //    setEnabled(true) (set in onChange) because setEnabled(false)
+    //    makes JUCE's Slider skip repaints on setValue(), which would
+    //    break the host-tempo mirror. The slider's onValueChange lambda
+    //    refuses to write proc.bpm when clockSource == 1, so any
+    //    accidental drag is a no-op.
+    if (proc.clockSource.load() == 1) {
+        const double shown = proc.hostBpm.load();
+        if (std::abs(bpmSlider.getValue() - shown) > 0.01)
+            bpmSlider.setValue(shown, dontSendNotification);
+    }
+
+    // Song-mode auto-follow: nudge the song timeline viewport so the
+    // currently playing block stays visible.
+    if (songFollowBtn.getToggleState() && proc.songModeActive) {
+        const int cur = proc.songPlayer.currentBlock;
+        if (cur >= 0 && cur < (int)proc.song.blocks.size()) {
+            const int blockX = cur * kBlockW;
+            const int viewW  = songViewport.getViewWidth();
+            const int curX   = songViewport.getViewPositionX();
+            const int pad    = kBlockW;  // keep ~one block of lead-in visible
+            if (blockX < curX + pad)
+                songViewport.setViewPosition(std::max(0, blockX - pad), 0);
+            else if (blockX + kBlockW > curX + viewW - pad)
+                songViewport.setViewPosition(std::max(0, blockX + kBlockW - viewW + pad), 0);
+        }
+    }
 
     blackoutBtn.setToggleState(proc.blackoutActive.load(), dontSendNotification);
     midiLearnBtn.setToggleState(proc.midiLearnActive.load(), dontSendNotification);
@@ -2127,4 +2296,162 @@ void DMXControllerEditor::showGeneratorMenu() {
             grid.repaint();
             barPreview.repaint();
         });
+}
+
+// ============================================================================
+// Song timeline content sizing (driven by the editor, not the component)
+// ============================================================================
+void DMXControllerEditor::updateSongTimelineSize() {
+    // Content height follows the viewport's inner area; width grows
+    // with block count but never shrinks below the visible area.
+    const int h       = std::max(kBlockH + 8, songViewport.getHeight());
+    const int blocks  = (int)proc.song.blocks.size();
+    const int minContentW = blocks * kBlockW + 20;
+    const int viewW   = std::max(1, songViewport.getViewWidth());
+    const int w       = std::max(minContentW, viewW);
+    if (songTimeline.getWidth() != w || songTimeline.getHeight() != h)
+        songTimeline.setSize(w, h);
+}
+
+// ============================================================================
+// Profile selector populator (includes built-ins + user-created profiles)
+// ============================================================================
+void DMXControllerEditor::refreshProfileSelector() {
+    profileSelector.clear(dontSendNotification);
+    const auto& all = getFixtureProfiles();
+    for (int i = 0; i < (int)all.size(); ++i) {
+        juce::String label = all[i].name;
+        if (!all[i].isBuiltin) label = "* " + label;   // mark user profiles
+        profileSelector.addItem(label, i + 1);
+    }
+    // Keep the active fixture's selection in sync after a rebuild.
+    if (proc.activeFixture >= 0 && proc.activeFixture < (int)proc.fixtures.size())
+        profileSelector.setSelectedId(
+            proc.fixtures[proc.activeFixture].profileIndex + 1,
+            dontSendNotification);
+}
+
+// ============================================================================
+// "New Custom Profile" dialog
+// ============================================================================
+void DMXControllerEditor::showNewProfileDialog() {
+    auto* aw = new AlertWindow("New Fixture Profile",
+        "Define a new fixture profile. Layout is a string of channel "
+        "letters: r/g/b (colour), w (white), d (dimmer).\n"
+        "Examples:\n"
+        "  rgb    - 3ch RGB\n"
+        "  drgb   - 4ch dim + RGB (par can style)\n"
+        "  rgbw   - 4ch RGBW",
+        AlertWindow::NoIcon);
+
+    aw->addTextEditor("name",       "My Fixture",                   "Name:");
+    aw->addTextEditor("layout",     "drgb",                         "Layout:");
+    aw->addTextEditor("chPerSeg",   "4",                            "Channels per segment:");
+    aw->addTextEditor("fixedSegs",  "0",                            "Fixed segments (0 = user-settable):");
+
+    juce::StringArray yesNo;
+    yesNo.add("No");
+    yesNo.add("Yes");
+    aw->addComboBox("hasDim",       yesNo, "Has master dim channel?");
+    aw->addComboBox("dimAlwaysMax", yesNo, "Lock dim channel to 100%? (par can style)");
+
+    aw->addTextEditor("description", "",                            "Description (optional):");
+
+    aw->addButton("Create", 1, KeyPress(KeyPress::returnKey));
+    aw->addButton("Cancel", 0, KeyPress(KeyPress::escapeKey));
+
+    aw->enterModalState(true,
+        ModalCallbackFunction::create([this, aw](int result) {
+            if (result != 1) return;
+
+            FixtureProfile prof;
+            prof.name               = aw->getTextEditorContents("name").trim().toStdString();
+            auto layoutStr          = aw->getTextEditorContents("layout").trim().toLowerCase();
+            prof.channelsPerSegment = aw->getTextEditorContents("chPerSeg").getIntValue();
+            prof.fixedSegments      = aw->getTextEditorContents("fixedSegs").getIntValue();
+            prof.hasMasterDim       = (aw->getComboBoxComponent("hasDim")->getSelectedItemIndex() == 1);
+            prof.dimAlwaysMax       = (aw->getComboBoxComponent("dimAlwaysMax")->getSelectedItemIndex() == 1);
+            prof.description        = aw->getTextEditorContents("description").trim().toStdString();
+            prof.isBuiltin          = false;
+
+            // Convert layout string to vector<char>, ignoring unknown
+            // characters so the user can't smuggle in garbage that
+            // would misroute DMX channels.
+            for (int i = 0; i < layoutStr.length(); ++i) {
+                juce_wchar ch = layoutStr[i];
+                if (ch == 'r' || ch == 'g' || ch == 'b' || ch == 'w' || ch == 'd')
+                    prof.channelLayout.push_back((char)ch);
+            }
+
+            // Sanity checks
+            if (prof.name.empty()) {
+                AlertWindow::showMessageBoxAsync(AlertWindow::WarningIcon,
+                    "Missing name", "Please enter a name for the profile.");
+                return;
+            }
+            if (prof.channelLayout.empty()) {
+                AlertWindow::showMessageBoxAsync(AlertWindow::WarningIcon,
+                    "Invalid layout",
+                    "Layout must contain at least one of: r, g, b, w, d.");
+                return;
+            }
+            if (prof.channelsPerSegment < (int)prof.channelLayout.size())
+                prof.channelsPerSegment = (int)prof.channelLayout.size();
+
+            {
+                // Mutate the shared profile list under the data lock
+                // so the audio thread never observes a half-built entry.
+                const ScopedLock l(proc.dataLock);
+                getFixtureProfiles().push_back(std::move(prof));
+            }
+            UserProfileStore::save();
+            refreshProfileSelector();
+        }), true /* deleteWhenDismissed */);
+}
+
+// ============================================================================
+// Delete currently-selected user profile (built-ins are protected)
+// ============================================================================
+void DMXControllerEditor::confirmAndDeleteCurrentUserProfile() {
+    const int id = profileSelector.getSelectedId();
+    if (id <= 0) return;
+    const int idx = id - 1;
+    auto& all = getFixtureProfiles();
+    if (idx < 0 || idx >= (int)all.size()) return;
+    if (all[idx].isBuiltin) {
+        AlertWindow::showMessageBoxAsync(AlertWindow::InfoIcon,
+            "Built-in profile",
+            "Built-in profiles cannot be deleted.");
+        return;
+    }
+
+    const juce::String name(all[idx].name);
+    AlertWindow::showOkCancelBox(AlertWindow::WarningIcon,
+        "Delete profile?",
+        "Delete custom profile \"" + name + "\"?\n\n"
+        "Any fixtures currently using it will fall back to the first "
+        "built-in profile.",
+        "Delete", "Cancel", nullptr,
+        ModalCallbackFunction::create([this, idx](int result) {
+            if (result != 1) return;  // cancelled
+            auto& list = getFixtureProfiles();
+            if (idx < 0 || idx >= (int)list.size() || list[idx].isBuiltin)
+                return;
+
+            {
+                const ScopedLock l(proc.dataLock);
+                list.erase(list.begin() + idx);
+                // Remap fixtures whose profileIndex is now dangling or
+                // has shifted. Anything >= idx was pushed down by 1;
+                // anything that equalled idx falls back to profile 0.
+                for (auto& fix : proc.fixtures) {
+                    if (fix.profileIndex == idx)      fix.profileIndex = 0;
+                    else if (fix.profileIndex > idx)  fix.profileIndex -= 1;
+                }
+            }
+            UserProfileStore::save();
+            refreshProfileSelector();
+            applyFixtureEdit();
+            refreshAll();
+        }));
 }

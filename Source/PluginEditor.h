@@ -20,6 +20,11 @@ public:
     float zoom  = 1.0f;
     bool  zoomFit = true;
 
+    // Accumulates wheel deltaY between emitted brightness steps so that
+    // trackpad smooth-scroll and notched mouse wheels both produce the
+    // same perceived rate of change. See mouseWheelMove().
+    float scrollAccum_ = 0.0f;
+
     explicit GridComponent(DMXControllerProcessor& p) : proc(p) {}
 
     void recalcSize();
@@ -79,6 +84,8 @@ private:
     GridComponent           grid;
     juce::Viewport          gridViewport;
     SongTimelineComponent   songTimeline;
+    juce::Viewport          songViewport;
+    juce::ToggleButton      songFollowBtn{"Follow"};
 
     // ---- Row 1: Transport ----
     juce::TextButton playBtn{"PLAY"}, stopBtn{"STOP"}, resetBtn{"RESET"};
@@ -110,6 +117,8 @@ private:
     juce::Label      dmxStartLabel{"", "DMX@"};
     juce::Slider     dmxStartSlider;
     juce::ComboBox   profileSelector;
+    juce::TextButton newProfileBtn{"+Profile"};
+    juce::TextButton delProfileBtn{"-Profile"};
     juce::Label      fixBrightLabel{"", "Fix Trim"};
     juce::Slider     fixBrightSlider;
 
@@ -182,6 +191,10 @@ private:
     void selectColor(int idx);
     void applyFixtureEdit();
     void showGeneratorMenu();
+    void updateSongTimelineSize();
+    void showNewProfileDialog();
+    void confirmAndDeleteCurrentUserProfile();
+    void refreshProfileSelector();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DMXControllerEditor)
 };

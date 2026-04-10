@@ -4,7 +4,7 @@
 
 By Stephen McLeod (aka [allmyfriendsaresynths](https://www.youtube.com/c/allmyfriendsaresynths))
 
-**Version:** 1.0 Beta
+**Version:** 1.0.0
 **Format:** Audio Unit MIDI FX Component (`.component`) — macOS Universal Binary (Apple Silicon + Intel)
 
 > **Disclaimer:** This is an **unofficial** plugin. It is **not affiliated with, endorsed by, or supported by BoomLights**. The LC-1X+ hardware is their product; this plugin is an independent fan project designed to make it more fun to use inside a DAW.
@@ -110,15 +110,9 @@ auval -v aumf Dmxl Amfs
 
 ---
 
-## Known bugs
-
-- Adding additional light fixtures may cause the plugin to crash.
-
----
-
 ## Disclaimer
 
-This is an early beta release. It is provided **as-is, with no warranty of any kind**, express or implied. It may crash, lose state, misbehave in your host, or do unexpected things to your lights. Don't use it in a situation where a misfiring light cue could hurt anyone. Test thoroughly before any live use.
+This plugin is provided **as-is, with no warranty of any kind**, express or implied. It may crash, lose state, misbehave in your host, or do unexpected things to your lights. Don't use it in a situation where a misfiring light cue could hurt anyone. Test thoroughly before any live use.
 
 This project is **not affiliated with, endorsed by, or supported by BoomLights**. The LC-1X+ is their product; this plugin is an independent fan project designed to make it more fun to use inside a DAW.
 

@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "UserProfileStore.h"
 #include <cstring>
 #include <cctype>
 #include <algorithm>
@@ -12,6 +13,11 @@ DMXControllerProcessor::DMXControllerProcessor()
 {
     std::memset(dmxState_,     0, sizeof(dmxState_));
     std::memset(prevDmxState_, -1, sizeof(prevDmxState_));
+
+    // Load any user-created fixture profiles from disk. Safe to call on
+    // every processor instantiation - the store guards against being
+    // loaded twice into the static profile list.
+    UserProfileStore::loadOnce();
 
     fixtures.emplace_back("Fixture 1", 8, 0, 0);
 }
@@ -37,7 +43,11 @@ void DMXControllerProcessor::addFixture() {
     const juce::ScopedLock l(dataLock);
     int nextDmx = 0;
     for (auto& f : fixtures) {
-        int end = f.dmxStart + f.numSegments * f.profile().channelsPerSegment;
+        // Use the full DMX footprint (profile.totalDmxChannels when set)
+        // so fixtures whose hardware reserves more channels than the
+        // plugin writes to - e.g. par cans in 7-channel mode - get the
+        // correct gap to the next fixture.
+        int end = f.dmxStart + f.dmxFootprint();
         if (end > nextDmx) nextDmx = end;
     }
     fixtures.emplace_back("Fixture " + std::to_string(fixtures.size() + 1),
@@ -165,8 +175,13 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     // when Auto-reset is enabled.
     bool hostPlaying = false;
     if (auto* ph = getPlayHead()) {
-        if (auto pos = ph->getPosition())
+        if (auto pos = ph->getPosition()) {
             hostPlaying = pos->getIsPlaying();
+            // Expose the host tempo so the editor can mirror it when
+            // the plugin is running in MIDI Clock mode.
+            if (auto hostBpmOpt = pos->getBpm())
+                hostBpm.store(*hostBpmOpt);
+        }
     }
     hostIsPlaying_.store(hostPlaying);
 
@@ -938,10 +953,12 @@ void DMXControllerProcessor::duplicateFixture(int idx) {
     const juce::ScopedLock l(dataLock);
     if (idx < 0 || idx >= (int)fixtures.size()) return;
     FixtureConfig copy = fixtures[idx];
-    // Bump DMX start to the next free block
+    // Bump DMX start to the next free block, honouring each fixture's
+    // full hardware footprint (e.g. 7ch par cans even though we only
+    // drive 4 channels).
     int nextDmx = 0;
     for (auto& f : fixtures) {
-        int end = f.dmxStart + f.numSegments * f.profile().channelsPerSegment;
+        int end = f.dmxStart + f.dmxFootprint();
         if (end > nextDmx) nextDmx = end;
     }
     copy.dmxStart = nextDmx;

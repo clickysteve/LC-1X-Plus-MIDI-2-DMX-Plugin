@@ -85,6 +85,11 @@ public:
     // Default = MIDI Clock since that's the intended use on a MIDI track.
     std::atomic<int>  clockSource{1};
 
+    // Last known tempo reported by the DAW (via AudioPlayHead). Updated
+    // every processBlock and read by the editor so the BPM display can
+    // reflect the host's tempo while MIDI clock mode is active.
+    std::atomic<double> hostBpm {120.0};
+
     // ==== Live global controls ====
     std::atomic<float> masterDimmer {1.0f};   // 0..1
     std::atomic<float> hueShiftDeg  {0.0f};   // -180..+180

@@ -20,29 +20,56 @@ struct FixtureProfile {
     bool dimAlwaysMax       = false;      // if true, 'd' channels are hardcoded
                                           // to 255 so colour dimming happens via
                                           // the RGB channels alone (par can mode)
+    bool isBuiltin          = true;       // false for user-created profiles
+                                          // (shown in the selector, persisted to
+                                          // ~/Library/Application Support)
 };
 
-inline const std::vector<FixtureProfile>& getFixtureProfiles() {
-    static const std::vector<FixtureProfile> profiles = {
-        {
+// The fixture profile list is intentionally a single mutable static
+// std::vector — user-created profiles are appended at the end by
+// UserProfileStore::loadOnce() and addUserProfile(). Capacity is
+// reserved up front so that push_back never reallocates, which means
+// references returned by FixtureConfig::profile() remain valid for
+// the lifetime of the audio thread's access window. All mutations
+// (add/remove/reload) are serialised via DMXControllerProcessor's
+// dataLock so the audio thread never races against a shifting vector.
+inline std::vector<FixtureProfile>& getFixtureProfiles() {
+    static std::vector<FixtureProfile> profiles = [] {
+        std::vector<FixtureProfile> p;
+        p.reserve(128);
+        p.push_back({
             "Giga 8 Bar (24ch)",
             {'r', 'g', 'b'}, {},
             false, 3, 0,
             "Giga 8 Bar: 8 RGB segments, 24 channels",
-            0
-        },
-        {
-            "76W RGB Par Can (4ch)",
+            0,
+            false,
+            true
+        });
+        p.push_back({
+            "76W RGB Par Can (7ch)",
             {'d', 'r', 'g', 'b'},       // ch1=dim (hardcoded max), ch2-4=RGB
-            {},                         // no extra channels — strobe/mode/speed unused
-            true, 4, 4,
-            "76W Par Can: Dim/R/G/B — dim is held at 100%, "
-            "brightness is driven by the RGB channels directly.",
+            {},                         // ch5-7 (strobe/mode/speed) left at 0 so
+                                        // the par can sits in its default
+                                        // "solid colour, no effects" state.
+            true, 4, 7,                 // writes 4 channels, reserves 7 for rig spacing
+            "76W Par Can (7-channel mode): Dim/R/G/B + unused Strobe/Mode/Speed. "
+            "The plugin drives only the first 4 channels (dim held at 100%, "
+            "brightness comes from the RGB channels), but the fixture still "
+            "occupies a 7-channel slot so the next fixture should start "
+            "7 addresses later.",
             1,                          // single-segment fixture
-            true                        // dimAlwaysMax: lock ch1 to 255
-        }
-    };
+            true,                       // dimAlwaysMax: lock ch1 to 255
+            true
+        });
+        return p;
+    }();
     return profiles;
+}
+
+inline int builtinProfileCount() {
+    // Keep in sync with the push_back calls above.
+    return 2;
 }
 
 // ============================================================================
@@ -69,6 +96,20 @@ struct FixtureConfig {
         int idx = profileIndex;
         if (idx < 0 || idx >= (int)all.size()) idx = 0;
         return all[idx];
+    }
+
+    /// Total DMX address footprint of this fixture — i.e. how many
+    /// channels the physical hardware reserves, regardless of how many
+    /// the plugin actually writes to. Used for auto-spacing when adding
+    /// / duplicating fixtures so the next fixture doesn't land inside
+    /// the unused-but-still-allocated tail of this one (e.g. par cans
+    /// in 7-channel mode where we only drive the first 4 channels).
+    int dmxFootprint() const {
+        const auto& prof = profile();
+        const int autoSpan = numSegments * prof.channelsPerSegment;
+        if (prof.totalDmxChannels > 0)
+            return std::max(prof.totalDmxChannels, autoSpan);
+        return autoSpan;
     }
 
     /// Map a vector of segment RGB colours → list of (relative DMX offset, value) pairs
