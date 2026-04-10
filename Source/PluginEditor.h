@@ -82,7 +82,8 @@ private:
 
     // ---- Row 1: Transport ----
     juce::TextButton playBtn{"PLAY"}, stopBtn{"STOP"}, resetBtn{"RESET"};
-    juce::ToggleButton autoResetBtn{"Auto-reset"};
+    juce::Label        autoResetLabel{"", "Auto-reset:"};
+    juce::ComboBox     autoResetSelector;
     juce::ToggleButton blackoutBtn{"BLACKOUT"};
     juce::TextButton tapBtn{"TAP"};
     juce::TextButton panicBtn{"PANIC"};

@@ -172,14 +172,19 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
 
     if (prevHostPlaying_ && !hostPlaying) {
         // DAW transport just stopped
-        if (autoResetOnStop.load()) {
-            // Reset all pattern banks to the first step so the next
-            // play starts from the beginning, even if the plugin's
-            // internal clock is running from the plugin's own PLAY.
+        const int mode = autoResetMode.load();
+        if (mode != 0) {
             const juce::ScopedLock l(dataLock);
-            currentStep.store(0);
-            for (auto& fix : fixtures)
-                fix.patternBank.currentStep = 0;
+            for (auto& fix : fixtures) {
+                int last = 0;
+                if (auto* pat = fix.patternBank.current())
+                    last = std::max(0, pat->numSteps - 1);
+                int target = (mode == 2) ? last : 0;
+                fix.patternBank.currentStep = target;
+            }
+            // Sync the global step to the active fixture's target
+            if (activeFixture >= 0 && activeFixture < (int)fixtures.size())
+                currentStep.store(fixtures[activeFixture].patternBank.currentStep);
             sampleCounter_ = 0.0;
             prevHostStep_  = -1;
             midiClockCount_ = 0;
@@ -215,7 +220,26 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
     // Transport (MIDI Clock mode only)
     if (src == 1) {
         if (msg.isMidiStart()) {
-            currentStep.store(0);
+            // Seed the step position based on auto-reset mode so that the
+            // very first MIDI clock tick lands on step 0:
+            //  - Last Step mode: start at numSteps-1; first tick wraps to 0.
+            //  - Otherwise:      start at 0; but because the first clock
+            //                    advances, step 0 will be briefly skipped.
+            //                    (Last Step mode is the recommended fix.)
+            {
+                const juce::ScopedLock l(dataLock);
+                const int mode = autoResetMode.load();
+                for (auto& fix : fixtures) {
+                    int last = 0;
+                    if (auto* pat = fix.patternBank.current())
+                        last = std::max(0, pat->numSteps - 1);
+                    fix.patternBank.currentStep = (mode == 2) ? last : 0;
+                }
+                if (activeFixture >= 0 && activeFixture < (int)fixtures.size())
+                    currentStep.store(fixtures[activeFixture].patternBank.currentStep);
+                else
+                    currentStep.store(0);
+            }
             isPlaying.store(true);
             midiClockCount_ = 0;
             needsInitialSend.store(true);
@@ -223,13 +247,22 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
         }
         if (msg.isMidiStop())     {
             isPlaying.store(false);
-            if (autoResetOnStop.load()) {
-                // Full rewind to step 0 on every fixture so the next
-                // play starts from the beginning
+            const int mode = autoResetMode.load();
+            if (mode != 0) {
+                // Rewind on every fixture so the next play starts cleanly.
+                // Mode 1 = first step, Mode 2 = last step (so first clock
+                // tick after Start wraps back to step 0).
                 const juce::ScopedLock l(dataLock);
-                currentStep.store(0);
-                for (auto& fix : fixtures)
-                    fix.patternBank.currentStep = 0;
+                for (auto& fix : fixtures) {
+                    int last = 0;
+                    if (auto* pat = fix.patternBank.current())
+                        last = std::max(0, pat->numSteps - 1);
+                    fix.patternBank.currentStep = (mode == 2) ? last : 0;
+                }
+                if (activeFixture >= 0 && activeFixture < (int)fixtures.size())
+                    currentStep.store(fixtures[activeFixture].patternBank.currentStep);
+                else
+                    currentStep.store(0);
                 sampleCounter_  = 0.0;
                 prevHostStep_   = -1;
                 midiClockCount_ = 0;
@@ -576,16 +609,26 @@ void DMXControllerProcessor::stopPlayback() {
     std::memset(dmxState_, 0, sizeof(dmxState_));
     emitDmxDelta(nullptr, 0);
 
-    if (autoResetOnStop.load()) {
-        // Rewind playback to the first step of every pattern/fixture bank
-        currentStep.store(0);
-        for (auto& fix : fixtures)
-            fix.patternBank.currentStep = 0;
+    const int mode = autoResetMode.load();
+    if (mode != 0) {
+        // Rewind playback on every fixture.
+        // Mode 1 = first step, Mode 2 = last step (so that the first
+        // MIDI clock tick after the next Start wraps back to step 0).
+        for (auto& fix : fixtures) {
+            int last = 0;
+            if (auto* pat = fix.patternBank.current())
+                last = std::max(0, pat->numSteps - 1);
+            fix.patternBank.currentStep = (mode == 2) ? last : 0;
+        }
+        if (activeFixture >= 0 && activeFixture < (int)fixtures.size())
+            currentStep.store(fixtures[activeFixture].patternBank.currentStep);
+        else
+            currentStep.store(0);
         sampleCounter_ = 0.0;
         prevHostStep_  = -1;
         midiClockCount_ = 0;
         if (songModeActive) songPlayer.reset();
-        // Recompute so the grid playhead visibly snaps back to column 0
+        // Recompute so the grid playhead visibly snaps back into place
         computeDmxState();
     }
 }
@@ -617,7 +660,7 @@ void DMXControllerProcessor::getStateInformation(juce::MemoryBlock& dest) {
     xml->setAttribute("masterDim",     (double)masterDimmer.load());
     xml->setAttribute("hueShift",      (double)hueShiftDeg.load());
     xml->setAttribute("swing",         (double)swing.load());
-    xml->setAttribute("autoResetOnStop", (bool)autoResetOnStop.load());
+    xml->setAttribute("autoResetMode", (int)autoResetMode.load());
     xml->setAttribute("floodMode",       (bool)floodMode.load());
 
     auto* fixXml = xml->createNewChildElement("Fixtures");
@@ -691,7 +734,11 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
     masterDimmer.store((float)xml->getDoubleAttribute("masterDim", 1.0));
     hueShiftDeg.store ((float)xml->getDoubleAttribute("hueShift",  0.0));
     swing.store      ((float)xml->getDoubleAttribute("swing",     0.0));
-    autoResetOnStop.store(xml->getBoolAttribute("autoResetOnStop", false));
+    // Back-compat: legacy "autoResetOnStop" bool maps to mode 1 (first step).
+    if (xml->hasAttribute("autoResetMode"))
+        autoResetMode.store(xml->getIntAttribute("autoResetMode", 0));
+    else
+        autoResetMode.store(xml->getBoolAttribute("autoResetOnStop", false) ? 1 : 0);
     floodMode.store(xml->getBoolAttribute("floodMode", false));
     // Flood output itself is a transient live state and is NOT restored
     floodActive.store(false);

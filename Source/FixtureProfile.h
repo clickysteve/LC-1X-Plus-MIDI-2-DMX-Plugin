@@ -17,6 +17,9 @@ struct FixtureProfile {
     int  totalDmxChannels   = 0;          // 0 = auto (segments × channelsPerSegment)
     std::string description;
     int  fixedSegments      = 0;          // 0 = user-set; >0 = force this count
+    bool dimAlwaysMax       = false;      // if true, 'd' channels are hardcoded
+                                          // to 255 so colour dimming happens via
+                                          // the RGB channels alone (par can mode)
 };
 
 inline const std::vector<FixtureProfile>& getFixtureProfiles() {
@@ -43,12 +46,14 @@ inline const std::vector<FixtureProfile>& getFixtureProfiles() {
             0
         },
         {
-            "76W RGB Par Can (7ch)",
-            {'d', 'r', 'g', 'b'},
-            {{4, 0}, {5, 0}, {6, 0}},   // strobe off, manual mode, speed 0
-            true, 4, 7,
-            "76W Par Can: Dim/R/G/B/Strobe/Mode/Speed",
-            1                           // single-segment fixture
+            "76W RGB Par Can (4ch)",
+            {'d', 'r', 'g', 'b'},       // ch1=dim (hardcoded max), ch2-4=RGB
+            {},                         // no extra channels — strobe/mode/speed unused
+            true, 4, 4,
+            "76W Par Can: Dim/R/G/B — dim is held at 100%, "
+            "brightness is driven by the RGB channels directly.",
+            1,                          // single-segment fixture
+            true                        // dimAlwaysMax: lock ch1 to 255
         }
     };
     return profiles;
@@ -80,15 +85,18 @@ struct FixtureConfig {
             auto c = colors[seg];
             int base = seg * prof.channelsPerSegment;
 
-            // Effective brightness for the master-dimmer channel. On a par
-            // can (or any fixture with a master dim) we want the dim channel
-            // to track the colour intensity so:
-            //  (a) setting the colour to black actually turns the fixture
-            //      off via the dim channel, and
-            //  (b) the global master dimmer & per-fixture brightness trim
-            //      that `applyTrim` bakes into the RGB values also show up
-            //      on the dim channel, instead of the dim sitting at 100%.
-            const int dimValue = std::max({c.r, c.g, c.b});
+            // Dimmer channel value. Two modes:
+            //  - dimAlwaysMax: lock to 255 always. Used for par cans where
+            //    brightness is driven entirely by the RGB channels and the
+            //    dim channel sitting at 0 would switch the whole fixture
+            //    off (even for non-black colours).
+            //  - default: track max(R,G,B). Setting the colour to black
+            //    turns the fixture off via the dim channel, and the
+            //    master/brightness trim — already baked into RGB by
+            //    applyTrim — also reaches the dim channel.
+            const int dimValue = prof.dimAlwaysMax
+                                   ? 255
+                                   : std::max({c.r, c.g, c.b});
 
             for (int ch = 0; ch < (int)prof.channelLayout.size(); ch++) {
                 int offset = base + ch;

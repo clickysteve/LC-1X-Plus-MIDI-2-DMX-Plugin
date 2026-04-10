@@ -428,18 +428,29 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     addAndMakeVisible(playBtn);
     addAndMakeVisible(stopBtn);
     addAndMakeVisible(resetBtn);
-    addAndMakeVisible(autoResetBtn);
+    addAndMakeVisible(autoResetLabel);
+    addAndMakeVisible(autoResetSelector);
     addAndMakeVisible(blackoutBtn);
     addAndMakeVisible(tapBtn);
     addAndMakeVisible(panicBtn);
     addAndMakeVisible(undoBtn);
     addAndMakeVisible(redoBtn);
 
-    autoResetBtn.setTooltip("When enabled, stopping playback resets back to step 1");
-    autoResetBtn.setClickingTogglesState(true);
-    autoResetBtn.setToggleState(proc.autoResetOnStop.load(), dontSendNotification);
-    autoResetBtn.onClick = [this] {
-        proc.autoResetOnStop.store(autoResetBtn.getToggleState());
+    autoResetLabel.setJustificationType(Justification::centredRight);
+    autoResetSelector.addItem("Off",       1);
+    autoResetSelector.addItem("1st Step",  2);
+    autoResetSelector.addItem("Last Step", 3);
+    autoResetSelector.setTooltip(
+        "Auto-reset on stop:\n"
+        "  Off       - leave playback where it is\n"
+        "  1st Step  - rewind to step 1\n"
+        "  Last Step - park at the last step; the first MIDI clock tick\n"
+        "              after Start wraps cleanly back to step 1 (recommended\n"
+        "              if the first step is being skipped when MIDI clock\n"
+        "              is received).");
+    autoResetSelector.setSelectedId(proc.autoResetMode.load() + 1, dontSendNotification);
+    autoResetSelector.onChange = [this] {
+        proc.autoResetMode.store(autoResetSelector.getSelectedId() - 1);
     };
 
     playBtn.setColour(TextButton::buttonColourId,  Theme::GREEN_ACCENT.darker(0.3f));
@@ -1166,7 +1177,8 @@ void DMXControllerEditor::resized() {
         playBtn     .setBounds(row.removeFromLeft(64));  row.removeFromLeft(gap);
         stopBtn     .setBounds(row.removeFromLeft(54));  row.removeFromLeft(gap);
         resetBtn    .setBounds(row.removeFromLeft(60));  row.removeFromLeft(gap);
-        autoResetBtn.setBounds(row.removeFromLeft(96));  row.removeFromLeft(gap);
+        autoResetLabel   .setBounds(row.removeFromLeft(74));
+        autoResetSelector.setBounds(row.removeFromLeft(100)); row.removeFromLeft(gap);
         tapBtn      .setBounds(row.removeFromLeft(46));  row.removeFromLeft(10);
         bpmLabel    .setBounds(row.removeFromLeft(34));
         bpmSlider   .setBounds(row.removeFromLeft(200)); row.removeFromLeft(10);
@@ -1376,7 +1388,11 @@ void DMXControllerEditor::timerCallback() {
 
     blackoutBtn.setToggleState(proc.blackoutActive.load(), dontSendNotification);
     midiLearnBtn.setToggleState(proc.midiLearnActive.load(), dontSendNotification);
-    autoResetBtn.setToggleState(proc.autoResetOnStop.load(), dontSendNotification);
+    {
+        int wantId = proc.autoResetMode.load() + 1;
+        if (autoResetSelector.getSelectedId() != wantId)
+            autoResetSelector.setSelectedId(wantId, dontSendNotification);
+    }
     floodToggleBtn.setToggleState(proc.floodMode.load(), dontSendNotification);
 
     for (int i = 0; i < 4; i++) {

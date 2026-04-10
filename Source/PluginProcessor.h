@@ -69,7 +69,12 @@ public:
 
     // Transport
     std::atomic<bool> isPlaying      {false};
-    std::atomic<bool> autoResetOnStop{false};  // if true, stopping resets to step 0
+    // 0 = Off (don't reset on stop)
+    // 1 = 1st Step (reset currentStep to 0 on stop)
+    // 2 = Last Step (reset currentStep to numSteps-1 on stop; first MIDI
+    //     clock tick after start wraps cleanly back to step 0, which
+    //     avoids the "first step is skipped" problem on clock start).
+    std::atomic<int>  autoResetMode  {0};
     std::atomic<int>  currentStep    {0};
     std::atomic<bool> needsInitialSend{false};
     double bpm = 120.0;
