@@ -108,6 +108,12 @@ auval -v aumf Dmxl Amfs
 
 ---
 
+## Known bugs
+
+- Adding additional light fixtures may cause the plugin to crash.
+
+---
+
 ## Disclaimer
 
 This is an early beta release. It is provided **as-is, with no warranty of any kind**, express or implied. It may crash, lose state, misbehave in your host, or do unexpected things to your lights. Don't use it in a situation where a misfiring light cue could hurt anyone. Test thoroughly before any live use.
