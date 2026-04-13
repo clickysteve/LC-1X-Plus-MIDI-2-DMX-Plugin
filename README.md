@@ -5,7 +5,7 @@
 By Stephen McLeod (aka [allmyfriendsaresynths](https://www.youtube.com/c/allmyfriendsaresynths))
 
 **Version:** 1.0.0
-**Format:** Audio Unit MIDI FX Component (`.component`) — macOS Universal Binary (Apple Silicon + Intel)
+**Formats:** Audio Unit (`.component`) · VST3 (`.vst3`) · Standalone (`.app`) — macOS Universal Binary (Apple Silicon + Intel), signed with Developer ID and notarised by Apple
 
 > **Disclaimer:** This is an **unofficial** plugin. It is **not affiliated with, endorsed by, or supported by BoomLights**. The LC-1X+ hardware is their product; this plugin is an independent fan project designed to make it more fun to use inside a DAW.
 
@@ -43,29 +43,45 @@ The plugin is a MIDI FX — drop it on a MIDI track, route its output to a MIDI 
 
 ## Install (prebuilt, non-developers)
 
-1. Grab the latest release from the [Releases page](https://github.com/clickysteve/LC-1X-Plus-MIDI-2-DMX-Plugin/releases).
-2. Unzip `LC-1X-Plus-MIDI2DMX.component.zip`.
-3. Move `LC-1X-Plus-MIDI2DMX.component` into:
+All release binaries are **signed with a Developer ID certificate and notarised by Apple** — no Gatekeeper warnings, no `xattr -cr` workarounds, works offline. Grab the latest from the [Releases page](https://github.com/clickysteve/LC-1X-Plus-MIDI-2-DMX-Plugin/releases).
 
-   ```
-   ~/Library/Audio/Plug-Ins/Components/
-   ```
+### Recommended — installer
 
-4. Because the component is not notarised, macOS will quarantine it. Strip the quarantine flag:
+Download **`LC-1X+ MIDI2DMX-1.0.0.pkg`** and double-click it. The installer walks you through a normal macOS install and places all three formats in the correct locations:
 
-   ```bash
-   xattr -cr ~/Library/Audio/Plug-Ins/Components/LC-1X-Plus-MIDI2DMX.component
-   ```
+| Format | Installed to | Used by |
+|---|---|---|
+| AU | `/Library/Audio/Plug-Ins/Components/` | Logic Pro, GarageBand, MainStage |
+| VST3 | `/Library/Audio/Plug-Ins/VST3/` | Ableton, Cubase, Reaper, Bitwig, Studio One, FL Studio |
+| Standalone | `/Applications/` | Open as a regular Mac app (great for MIDI-controller-only rigs) |
 
-5. (Optional) Force a rescan of the Audio Unit cache:
+Then relaunch your DAW and rescan plugins. The plugin appears as a MIDI FX under **AMFAS → LC-1X+ MIDI2DMX**.
 
-   ```bash
-   killall -9 AudioComponentRegistrar
-   ```
+### Manual — drag-install
 
-6. Relaunch Logic Pro (or your host). It should appear as a MIDI FX under **AMFAS → LC-1X+ MIDI2DMX**.
+If you'd rather only install the format you use, grab the relevant `.zip` asset and drop the bundle into the folder listed above:
 
-If Logic says the plugin failed validation, run `auval -v aumf Dmxl Amfs` in Terminal and check the output.
+- `LC-1X+ MIDI2DMX.component.zip` → `/Library/Audio/Plug-Ins/Components/`
+- `LC-1X+ MIDI2DMX.vst3.zip` → `/Library/Audio/Plug-Ins/VST3/`
+- `LC-1X+ MIDI2DMX.app.zip` → `/Applications/`
+
+Unzip with Finder or `ditto -x -k <file>.zip .` — avoid plain `unzip`, which can strip the code signature.
+
+### Verify the notarisation (optional)
+
+```bash
+xcrun stapler validate "LC-1X+ MIDI2DMX-1.0.0.pkg"
+# → The validate action worked!
+```
+
+### If Logic says the plugin failed validation
+
+Force an Audio Unit cache rescan and run `auval` manually:
+
+```bash
+killall -9 AudioComponentRegistrar
+auval -v aumf Dmxl Amfs
+```
 
 ---
 
@@ -81,15 +97,15 @@ cd LC-1X-Plus-MIDI-2-DMX-Plugin
 # 2. Clone JUCE into the project folder (JUCE is not vendored — GPL hygiene)
 git clone --depth 1 https://github.com/juce-framework/JUCE.git
 
-# 3. Configure and build
+# 3. Configure and build (unsigned — fine for local dev)
 cmake -B build -G Xcode
 cmake --build build --config Release
 
-# 4. Install the AU component
-cp -R "build/LC-1X-Plus-MIDI2DMX_artefacts/Release/AU/LC-1X-Plus-MIDI2DMX.component" \
+# 4. Install the AU component locally and ad-hoc sign it
+cp -R "build/DMXLightController_artefacts/Release/AU/LC-1X+ MIDI2DMX.component" \
       ~/Library/Audio/Plug-Ins/Components/
 codesign --force --deep --sign - \
-      ~/Library/Audio/Plug-Ins/Components/LC-1X-Plus-MIDI2DMX.component
+      ~/Library/Audio/Plug-Ins/Components/"LC-1X+ MIDI2DMX.component"
 killall -9 AudioComponentRegistrar
 ```
 
@@ -98,6 +114,12 @@ Then open Logic and validate:
 ```bash
 auval -v aumf Dmxl Amfs
 ```
+
+### Producing signed, notarised release artefacts
+
+If you have a Developer ID Application cert, a Developer ID Installer cert, and a notarytool keychain profile set up, `release.sh` at the repo root will build all three formats, sign them, notarise each bundle and the `.pkg` installer, staple the tickets, and drop the results into `dist/`.
+
+See `release.sh` for the full flow. The CMake cache variable `LC1X_CODESIGN_IDENTITY` gates the post-build code signing — leave it empty (default) for unsigned local dev builds.
 
 ---
 
