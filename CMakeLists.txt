@@ -67,3 +67,39 @@ target_link_libraries(DMXLightController
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
+
+# ---------- macOS code signing (optional) ----------
+# Leave empty for unsigned local dev builds. Set to a full Developer ID
+# Application identity string to sign every bundle post-build, e.g.:
+#   -DLC1X_CODESIGN_IDENTITY="Developer ID Application: Stephen McLeod Blythe (2N9AC8M66C)"
+set(LC1X_CODESIGN_IDENTITY "" CACHE STRING
+    "macOS Developer ID Application identity for post-build codesign (empty = unsigned)")
+
+if(APPLE AND LC1X_CODESIGN_IDENTITY)
+    set(LC1X_ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/Resources/Entitlements.plist")
+
+    foreach(fmt AU VST3 Standalone)
+        set(_tgt "DMXLightController_${fmt}")
+        if(TARGET ${_tgt})
+            # Disable Xcode's built-in code signing — we do it explicitly below
+            # with the right identity, entitlements, and hardened runtime flags.
+            # Without this, Xcode picks up any Developer ID cert it finds in the
+            # keychain and runs its own signing phase, which clashes with ours
+            # (especially for VST3, where a helper tool produces moduleinfo.xml).
+            set_target_properties(${_tgt} PROPERTIES
+                XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY       ""
+                XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED    "NO"
+                XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED     "NO"
+            )
+
+            add_custom_command(TARGET ${_tgt} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E echo
+                    "Codesigning $<TARGET_BUNDLE_DIR:${_tgt}> with ${LC1X_CODESIGN_IDENTITY}"
+                COMMAND codesign --force --options runtime --timestamp
+                    --sign "${LC1X_CODESIGN_IDENTITY}"
+                    --entitlements "${LC1X_ENTITLEMENTS}"
+                    "$<TARGET_BUNDLE_DIR:${_tgt}>"
+                VERBATIM)
+        endif()
+    endforeach()
+endif()
