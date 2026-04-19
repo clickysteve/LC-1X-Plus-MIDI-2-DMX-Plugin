@@ -1,0 +1,65 @@
+name: Build Windows VST3
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:       # manual trigger from Actions tab
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Clone JUCE
+        run: git clone --depth 1 https://github.com/juce-framework/JUCE.git
+
+      - name: Configure (Release)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: List artefacts
+        run: dir build\DMXLightController_artefacts\Release /s
+        shell: cmd
+
+      # --- Upload VST3 ---
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: LC-1X-Plus-MIDI2DMX-Windows-VST3
+          path: build/DMXLightController_artefacts/Release/VST3/
+          if-no-files-found: error
+
+      # --- Upload Standalone ---
+      - name: Upload Standalone
+        uses: actions/upload-artifact@v4
+        with:
+          name: LC-1X-Plus-MIDI2DMX-Windows-Standalone
+          path: build/DMXLightController_artefacts/Release/Standalone/
+          if-no-files-found: error
+
+      # --- Attach to GitHub Release on tag push ---
+      - name: Zip VST3 for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: Compress-Archive -Path "build\DMXLightController_artefacts\Release\VST3\*" -DestinationPath "LC-1X-Plus-MIDI2DMX-Windows-VST3.zip"
+        shell: pwsh
+
+      - name: Zip Standalone for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: Compress-Archive -Path "build\DMXLightController_artefacts\Release\Standalone\*" -DestinationPath "LC-1X-Plus-MIDI2DMX-Windows-Standalone.zip"
+        shell: pwsh
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            LC-1X-Plus-MIDI2DMX-Windows-VST3.zip
+            LC-1X-Plus-MIDI2DMX-Windows-Standalone.zip
