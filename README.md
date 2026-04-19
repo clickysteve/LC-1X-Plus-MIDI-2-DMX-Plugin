@@ -5,7 +5,8 @@
 By Stephen McLeod (aka [allmyfriendsaresynths](https://www.youtube.com/c/allmyfriendsaresynths))
 
 **Version:** 1.0.0
-**Formats:** Audio Unit (`.component`) · VST3 (`.vst3`) · Standalone (`.app`) — macOS Universal Binary (Apple Silicon + Intel), signed with Developer ID and notarised by Apple
+**Formats:** Audio Unit (`.component`) · VST3 (`.vst3`) · Standalone (`.app`)
+**Platforms:** macOS (Universal Binary — Apple Silicon + Intel, signed & notarised) · Windows (64-bit VST3 + Standalone, built via GitHub Actions)
 
 > **Disclaimer:** This is an **unofficial** plugin. It is **not affiliated with, endorsed by, or supported by BoomLights**. The LC-1X+ hardware is their product; this plugin is an independent fan project designed to make it more fun to use inside a DAW.
 
@@ -43,9 +44,11 @@ The plugin is a MIDI FX — drop it on a MIDI track, route its output to a MIDI 
 
 ## Install (prebuilt, non-developers)
 
-All release binaries are **signed with a Developer ID certificate and notarised by Apple** — no Gatekeeper warnings, no `xattr -cr` workarounds, works offline. Grab the latest from the [Releases page](https://github.com/clickysteve/LC-1X-Plus-MIDI-2-DMX-Plugin/releases).
+Grab the latest from the [Releases page](https://github.com/clickysteve/LC-1X-Plus-MIDI-2-DMX-Plugin/releases).
 
-### Recommended — installer
+### macOS — installer (recommended)
+
+All macOS binaries are **signed with a Developer ID certificate and notarised by Apple** — no Gatekeeper warnings, no `xattr -cr` workarounds, works offline.
 
 Download **`LC-1X+ MIDI2DMX-1.0.0.pkg`** and double-click it. The installer walks you through a normal macOS install and places all three formats in the correct locations:
 
@@ -82,6 +85,20 @@ Force an Audio Unit cache rescan and run `auval` manually:
 killall -9 AudioComponentRegistrar
 auval -v aumf Dmxl Amfs
 ```
+
+### Windows
+
+Download **`LC-1X-Plus-MIDI2DMX-Windows-VST3.zip`** from the [Releases page](https://github.com/clickysteve/LC-1X-Plus-MIDI-2-DMX-Plugin/releases) and extract the `.vst3` folder into your VST3 plugin directory — typically:
+
+```
+C:\Program Files\Common Files\VST3\
+```
+
+A standalone `.exe` is also available as **`LC-1X-Plus-MIDI2DMX-Windows-Standalone.zip`** — extract and run directly, no installation needed.
+
+Restart your DAW and rescan plugins. The plugin appears under **AMFAS → LC-1X+ MIDI2DMX**.
+
+> **Note:** Windows binaries are not code-signed, so Windows Defender SmartScreen may show a warning on first run. Click **More info → Run anyway** to proceed.
 
 ---
 
