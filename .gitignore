@@ -55,3 +55,9 @@ _deps/
 *.zip
 *.dmg
 *.pkg
+
+# Local-only Claude context
+CLAUDE.md
+
+# Windows build output
+dist-windows/
