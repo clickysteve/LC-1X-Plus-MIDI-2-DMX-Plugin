@@ -8,6 +8,11 @@ on:
     branches: [main]
   workflow_dispatch:       # manual trigger from Actions tab
 
+# Needed so the release step can create a GitHub Release
+# (the default GITHUB_TOKEN is read-only).
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
