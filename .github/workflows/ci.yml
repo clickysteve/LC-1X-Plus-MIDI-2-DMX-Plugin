@@ -1,0 +1,96 @@
+# LC-1X+ MIDI2DMX — CI: unit tests + plugin validation
+#
+# Place at .github/workflows/ci.yml
+# (Windows release builds stay in build-windows.yml.)
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  JUCE_TAG: 8.0.12   # keep in sync with the local JUCE/ checkout and build-windows.yml
+
+jobs:
+  # ---------------------------------------------------------------
+  # Headless unit tests (fast, runs on every push)
+  # ---------------------------------------------------------------
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JUCE build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev libx11-dev libxext-dev \
+            libxrandr-dev libxcursor-dev libxinerama-dev libfreetype6-dev \
+            libfontconfig1-dev
+
+      - name: Clone JUCE (pinned)
+        run: git clone --branch "$JUCE_TAG" --depth 1 https://github.com/juce-framework/JUCE.git
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLC1X_BUILD_TESTS=ON
+
+      - name: Build tests
+        run: cmake --build build --target LC1XTests -j"$(nproc)"
+
+      - name: Run tests
+        run: ./build/LC1XTests_artefacts/Release/LC1XTests
+
+  # ---------------------------------------------------------------
+  # macOS build + auval + pluginval
+  # ---------------------------------------------------------------
+  validate-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone JUCE (pinned)
+        run: git clone --branch "$JUCE_TAG" --depth 1 https://github.com/juce-framework/JUCE.git
+
+      - name: Configure and build (unsigned)
+        run: |
+          cmake -B build
+          cmake --build build -j4
+
+      - name: Install AU for validation
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "build/DMXLightController_artefacts/AU/LC-1X+ MIDI2DMX.component" \
+                ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+
+      - name: auval (Apple AU validation)
+        run: auval -v aumi Dmxl Amfs
+
+      - name: Download pluginval
+        run: |
+          curl -L "https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip" -o pluginval.zip
+          unzip -q pluginval.zip
+
+      - name: pluginval VST3
+        run: |
+          pluginval.app/Contents/MacOS/pluginval \
+            --strictness-level 10 --skip-gui-tests --validate-in-process \
+            --output-dir pluginval-logs \
+            "build/DMXLightController_artefacts/VST3/LC-1X+ MIDI2DMX.vst3"
+
+      - name: pluginval AU
+        run: |
+          pluginval.app/Contents/MacOS/pluginval \
+            --strictness-level 10 --skip-gui-tests --validate-in-process \
+            --output-dir pluginval-logs \
+            "$HOME/Library/Audio/Plug-Ins/Components/LC-1X+ MIDI2DMX.component"
+
+      - name: Upload pluginval logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pluginval-logs
+          path: pluginval-logs/
+          if-no-files-found: ignore

@@ -25,6 +25,10 @@ public:
     // same perceived rate of change. See mouseWheelMove().
     float scrollAccum_ = 0.0f;
 
+    // Timestamp of the last wheel-dim edit, used to take one undo
+    // snapshot per scroll gesture (rather than one per emitted step).
+    double lastWheelEditMs_ = 0.0;
+
     explicit GridComponent(DMXControllerProcessor& p) : proc(p) {}
 
     void recalcSize();
@@ -177,6 +181,16 @@ private:
     juce::StringArray cachedMidiOutDevices_;
     juce::StringArray cachedMidiInDevices_;
     int refreshCounter_ = 0;
+
+    // Last observed value of proc.sceneLoadBroadcast — when it changes, a
+    // scene was loaded via a MIDI mapping and the controls need a refresh.
+    int lastSceneLoadCount_ = 0;
+
+    // ---- Parameter attachments (host automation ↔ UI) ----
+    using SliderAtt = juce::AudioProcessorValueTreeState::SliderAttachment;
+    using ButtonAtt = juce::AudioProcessorValueTreeState::ButtonAttachment;
+    std::unique_ptr<SliderAtt> masterDimAtt_, hueAtt_, swingAtt_;
+    std::unique_ptr<ButtonAtt> blackoutAtt_;
 
     // Timer‑based UI refresh
     void timerCallback() override;

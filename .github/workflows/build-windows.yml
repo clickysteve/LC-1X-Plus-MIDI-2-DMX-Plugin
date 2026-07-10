@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Clone JUCE
-        run: git clone --depth 1 https://github.com/juce-framework/JUCE.git
+        run: git clone --branch 8.0.12 --depth 1 https://github.com/juce-framework/JUCE.git
 
       - name: Configure (Release)
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release

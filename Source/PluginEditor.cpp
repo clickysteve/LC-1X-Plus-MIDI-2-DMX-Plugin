@@ -315,6 +315,14 @@ void GridComponent::mouseWheelMove(const MouseEvent& e, const MouseWheelDetails&
     float peak = (float)std::max({c.r, c.g, c.b});
     if (peak <= 0.0f) return;
 
+    // One undo snapshot per scroll gesture (a >400 ms pause in wheel
+    // activity starts a new gesture) so wheel-dimming is undoable like
+    // painting, without flooding the undo stack one entry per tick.
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    if (nowMs - lastWheelEditMs_ > 400.0)
+        proc.snapshot();
+    lastWheelEditMs_ = nowMs;
+
     // Work in perceptual (gamma-corrected) space so each accumulated
     // wheel-step feels like a uniform brightness change. LEDs are ~linear
     // in PWM duty cycle but human vision is ~gamma 2.2 — a linear DMX
@@ -535,26 +543,25 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     };
     stopBtn.onClick  = [this] { proc.stopPlayback(); playBtn.setButtonText("PLAY"); };
     resetBtn.onClick = [this] { proc.resetPlayback(); };
-    blackoutBtn.onClick = [this] {
-        proc.blackoutActive.store(blackoutBtn.getToggleState());
-        proc.pushPreview();
-    };
+    // Blackout is a host parameter — the attachment (created below with the
+    // other live-control attachments) handles state + preview.
     tapBtn.onClick   = [this] { proc.tapTempo(); bpmSlider.setValue(proc.bpm, dontSendNotification); };
-    panicBtn.onClick = [this] { proc.panicBlackout(); blackoutBtn.setToggleState(true, dontSendNotification); };
+    panicBtn.onClick = [this] { proc.panicBlackout(); };   // latches the Blackout param
     undoBtn.onClick  = [this] { if (proc.undo()) { grid.repaint(); barPreview.repaint(); } };
     redoBtn.onClick  = [this] { if (proc.redo()) { grid.repaint(); barPreview.repaint(); } };
 
     addAndMakeVisible(bpmSlider);
     addAndMakeVisible(bpmLabel);
-    bpmSlider.setRange(20.0, 300.0, 0.1);
+    // 40..300 matches the BpmCC MIDI mapping and tap-tempo clamps
+    bpmSlider.setRange(40.0, 300.0, 0.1);
     bpmSlider.setValue(proc.bpm);
     bpmSlider.setTextBoxStyle(Slider::TextBoxLeft, false, 50, 20);
     bpmSlider.setSliderStyle(Slider::LinearHorizontal);
     bpmSlider.onValueChange = [this] {
-        // Don't let the host-tempo mirror in MIDI Clock mode clobber
-        // proc.bpm — that value is the "internal" tempo and should
-        // survive a round-trip through MIDI Clock mode unchanged.
-        if (proc.clockSource.load() != 1)
+        // Don't let the host-tempo mirror in MIDI Clock / Host Sync mode
+        // clobber proc.bpm — that value is the "internal" tempo and should
+        // survive a round-trip through the external modes unchanged.
+        if (proc.clockSource.load() == 0)
             proc.bpm = bpmSlider.getValue();
     };
     bpmLabel.setText("BPM", dontSendNotification);
@@ -563,8 +570,14 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     addAndMakeVisible(clockSrcSelector);
     clockSrcSelector.addItem("Internal",   1);
     clockSrcSelector.addItem("MIDI Clock", 2);
-    // Clamp any legacy saved state of "Sync DAW" (=2) back to Internal.
-    if (proc.clockSource.load() >= 2) proc.clockSource.store(0);
+    clockSrcSelector.addItem("Host Sync",  3);
+    clockSrcSelector.setTooltip(
+        "Clock source:\n"
+        "  Internal   - the plugin's own timer, uses the BPM slider\n"
+        "  MIDI Clock - follows incoming MIDI clock/start/stop messages\n"
+        "  Host Sync  - locks sample-accurately to the DAW playhead\n"
+        "               (recommended in Logic: follows tempo changes,\n"
+        "               loops and locates exactly on the grid)");
     clockSrcSelector.setSelectedId(proc.clockSource.load() + 1, dontSendNotification);
 
     // Apply initial BPM-slider state based on current clock source. This
@@ -575,12 +588,12 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     // the 30 Hz timer must never touch it or it will fight with the user's
     // mouse drags.
     {
-        const bool midiClock = proc.clockSource.load() == 1;
+        const bool external = proc.clockSource.load() >= 1;   // MIDI Clock or Host Sync
         bpmSlider.setEnabled(true);
-        bpmSlider.setAlpha(midiClock ? 0.4f : 1.0f);
+        bpmSlider.setAlpha(external ? 0.4f : 1.0f);
         bpmSlider.setInterceptsMouseClicks(true, true);
-        tapBtn.setEnabled(!midiClock);
-        tapBtn.setAlpha(midiClock ? 0.4f : 1.0f);
+        tapBtn.setEnabled(!external);
+        tapBtn.setAlpha(external ? 0.4f : 1.0f);
     }
 
     clockSrcSelector.onChange = [this] {
@@ -592,15 +605,15 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         // Apply BPM-slider visual state immediately on change. We do this
         // here (on the message thread, in response to a user action) rather
         // than in the timer so we never interrupt a live mouse drag.
-        const bool midiClock = v == 1;
+        const bool external = v >= 1;     // MIDI Clock or Host Sync
         bpmSlider.setEnabled(true);       // always enabled: setEnabled(false)
                                           // suppresses setValue() repaints
-                                          // which would break the MIDI Clock
+                                          // which would break the external
                                           // host-tempo mirror.
-        bpmSlider.setAlpha(midiClock ? 0.4f : 1.0f);
+        bpmSlider.setAlpha(external ? 0.4f : 1.0f);
         bpmSlider.setInterceptsMouseClicks(true, true);
-        tapBtn.setEnabled(!midiClock);
-        tapBtn.setAlpha(midiClock ? 0.4f : 1.0f);
+        tapBtn.setEnabled(!external);
+        tapBtn.setAlpha(external ? 0.4f : 1.0f);
     };
 
     // ========== Row 2: MIDI In/Out ==========
@@ -732,7 +745,10 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
                 if (result == 1) {
                     auto name = aw->getTextEditorContents("name").trim();
                     if (name.isNotEmpty()) {
-                        proc.fixtures[proc.activeFixture].name = name.toStdString();
+                        {
+                            const juce::ScopedLock l(proc.dataLock);
+                            proc.fixtures[proc.activeFixture].name = name.toStdString();
+                        }
                         refreshFixtureSelector();
                     }
                 }
@@ -850,7 +866,13 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     brightnessSlider.setValue(1.0);
     brightnessSlider.setSliderStyle(Slider::LinearHorizontal);
     brightnessSlider.setTextBoxStyle(Slider::NoTextBox, true, 0, 0);
-    brightnessSlider.onValueChange = [this] { grid.brightness = (float)brightnessSlider.getValue(); };
+    brightnessSlider.onValueChange = [this] {
+        const float v = (float)brightnessSlider.getValue();
+        grid.brightness = v;
+        // Keep the processor-side mirror in sync so a mapped Brightness CC
+        // and the slider agree (the timer mirrors CC moves back here).
+        proc.brightnessLive.store(v);
+    };
 
     addAndMakeVisible(fillBtn);
     addAndMakeVisible(clearBtn);
@@ -873,6 +895,7 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
 
         m.showMenuAsync(PopupMenu::Options().withTargetComponent(clearing ? clearBtn : fillBtn),
             [this, clearing](int result) {
+                const juce::ScopedLock lock(proc.dataLock);
                 auto* pat = proc.currentBank().current();
                 if (!pat || result == 0) return;
 
@@ -881,8 +904,13 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
                     paintC = {0, 0, 0};
                 } else {
                     RGBColor c = grid.activeColor;
-                    float b = grid.brightness;
-                    c.r = (uint8_t)(c.r * b); c.g = (uint8_t)(c.g * b); c.b = (uint8_t)(c.b * b);
+                    // Same perceptual→linear conversion as applyColor(),
+                    // so Fill produces the same colour as painting a cell
+                    // at the same brightness-slider position.
+                    const float b = std::pow(std::clamp(grid.brightness, 0.0f, 1.0f), 2.2f);
+                    c.r = (uint8_t)std::clamp((int)std::round(c.r * b), 0, 255);
+                    c.g = (uint8_t)std::clamp((int)std::round(c.g * b), 0, 255);
+                    c.b = (uint8_t)std::clamp((int)std::round(c.b * b), 0, 255);
                     paintC = c;
                 }
 
@@ -910,6 +938,7 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     addAndMakeVisible(randBtn);
 
     copyBtn.onClick = [this] {
+        const juce::ScopedLock l(proc.dataLock);
         auto* pat = proc.currentBank().current();
         if (!pat) return;
         if (grid.selStart >= 0 && grid.selEnd >= 0) {
@@ -921,6 +950,7 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         }
     };
     pasteBtn.onClick = [this] {
+        const juce::ScopedLock l(proc.dataLock);
         auto* pat = proc.currentBank().current();
         if (!pat) return;
         proc.snapshot();
@@ -933,15 +963,19 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         grid.repaint();
     };
     mirrorBtn.onClick = [this] {
+        const juce::ScopedLock l(proc.dataLock);
         if (auto* pat = proc.currentBank().current()) { proc.snapshot(); pat->mirror(); grid.repaint(); }
     };
     shiftLBtn.onClick = [this] {
+        const juce::ScopedLock l(proc.dataLock);
         if (auto* pat = proc.currentBank().current()) { proc.snapshot(); pat->shiftLeft(); grid.repaint(); }
     };
     shiftRBtn.onClick = [this] {
+        const juce::ScopedLock l(proc.dataLock);
         if (auto* pat = proc.currentBank().current()) { proc.snapshot(); pat->shiftRight(); grid.repaint(); }
     };
     randBtn.onClick = [this] {
+        const juce::ScopedLock l(proc.dataLock);
         if (auto* pat = proc.currentBank().current()) {
             proc.snapshot();
             pat->randomize(PRESET_COLORS, NUM_PRESET_COLORS - 1);
@@ -965,7 +999,14 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     fadeSelector.addItem("4",  3);
     fadeSelector.addItem("8",  4);
     fadeSelector.addItem("16", 5);
-    fadeSelector.setSelectedId(1);
+    // Reflect the crossfade value restored from saved state instead of
+    // always showing "0".
+    {
+        const int cf = proc.crossfadeSteps.load();
+        const int id = (cf >= 16) ? 5 : (cf >= 8) ? 4 : (cf >= 4) ? 3
+                     : (cf >= 2) ? 2 : 1;
+        fadeSelector.setSelectedId(id, dontSendNotification);
+    }
     fadeSelector.onChange = [this] {
         int steps[] = {0, 2, 4, 8, 16};
         proc.crossfadeSteps = steps[fadeSelector.getSelectedId() - 1];
@@ -1002,9 +1043,7 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
 
     hueResetBtn.setTooltip("Reset hue shift to zero");
     hueResetBtn.onClick = [this] {
-        hueSlider.setValue(0.0, sendNotificationSync);
-        proc.hueShiftDeg.store(0.0f);
-        proc.pushPreview();
+        hueSlider.setValue(0.0, sendNotificationSync);   // → hueShift parameter
         grid.repaint();
         barPreview.repaint();
     };
@@ -1032,18 +1071,23 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     swingSlider.setTextValueSuffix(" %");
     swingSlider.setNumDecimalPlacesToDisplay(1);
     swingSlider.setDoubleClickReturnValue(true, 50.0);
+    swingSlider.setTooltip("Swing (50% = straight, 75% = triplet feel). "
+                           "Applies with the Internal and Host Sync clocks. "
+                           "In MIDI Clock mode the plugin follows the "
+                           "incoming ticks as-is.");
 
     // Scenes section label
     addAndMakeVisible(scenesLabel);
     scenesLabel  .setJustificationType(Justification::centredRight);
 
-    masterDimSlider.onValueChange = [this] { proc.masterDimmer.store((float)masterDimSlider.getValue()); proc.pushPreview(); };
-    hueSlider      .onValueChange = [this] { proc.hueShiftDeg.store ((float)hueSlider.getValue());       proc.pushPreview(); };
-    // Swing: UI 50..75%, internal 0..0.5  (50 → 0, 75 → 0.5)
-    swingSlider    .onValueChange = [this] {
-        double pct = swingSlider.getValue();
-        proc.swing.store((float)((pct - 50.0) * 0.02));
-    };
+    // Master / Hue / Swing / Blackout are host parameters. The attachments
+    // keep slider ↔ parameter in sync in both directions (mouse drags,
+    // automation playback, MIDI-learned CCs), and the processor's
+    // parameterChanged() pushes a live hardware preview on every move.
+    masterDimAtt_ = std::make_unique<SliderAtt>(proc.apvts, "masterDim", masterDimSlider);
+    hueAtt_       = std::make_unique<SliderAtt>(proc.apvts, "hueShift",  hueSlider);
+    swingAtt_     = std::make_unique<SliderAtt>(proc.apvts, "swing",     swingSlider);
+    blackoutAtt_  = std::make_unique<ButtonAtt>(proc.apvts, "blackout",  blackoutBtn);
 
     // FLOOD toggle — when enabled, the next colour button click becomes a
     // temporary flood override instead of selecting the paint colour.
@@ -1058,10 +1102,9 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         const bool on = floodToggleBtn.getToggleState();
         proc.floodMode.store(on);
         if (!on) {
-            // Turning flood mode off clears any active flood
-            proc.floodActive.store(false);
-            proc.floodColor.store(0);
-            proc.pushPreview();
+            // Turning flood mode off clears any active flood (via the
+            // Flood parameter, so automation lanes see it too)
+            proc.setFloodParams(false, -1);
             grid.repaint();
             barPreview.repaint();
         }
@@ -1118,11 +1161,14 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
                     aw->enterModalState(true, ModalCallbackFunction::create([this, aw](int result) {
                         if (result == 1) {
                             auto name = aw->getTextEditorContents("name").trim();
-                            if (name.isNotEmpty())
-                                if (auto* p = proc.currentBank().current()) {
-                                    p->name = name.toStdString();
-                                    refreshPatternSelector();
+                            if (name.isNotEmpty()) {
+                                {
+                                    const juce::ScopedLock l(proc.dataLock);
+                                    if (auto* p = proc.currentBank().current())
+                                        p->name = name.toStdString();
                                 }
+                                refreshPatternSelector();
+                            }
                         }
                     }), true);
                 }
@@ -1167,39 +1213,59 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     patternSelector.onChange = [this] {
         int idx = patternSelector.getSelectedId() - 1;
         if (idx >= 0) {
-            proc.currentBank().select(idx);
+            // locks + captures fade + reflects into the Pattern parameter
+            proc.selectPatternNotifyingHost(idx);
             grid.recalcSize();
             grid.repaint();
             refreshStepsLabel();
         }
     };
+    // NOTE: every handler below that adds/removes/reshapes a Pattern must
+    // hold proc.dataLock — the audio and clock threads hold Pattern*
+    // pointers inside their own locked regions, and reallocating the
+    // patterns vector (or a pattern's grid) under them is a use-after-free.
     newPatBtn.onClick = [this] {
-        int segs = proc.fixtures[proc.activeFixture].numSegments;
-        int idx = proc.currentBank().addPattern(segs);
-        proc.currentBank().select(idx);
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            int segs = proc.fixtures[proc.activeFixture].numSegments;
+            int idx = proc.currentBank().addPattern(segs);
+            proc.currentBank().select(idx);
+        }
         refreshPatternSelector();
         grid.recalcSize(); grid.repaint();
     };
     dupPatBtn.onClick = [this] {
-        int idx = proc.currentBank().duplicatePattern();
-        if (idx >= 0) proc.currentBank().select(idx);
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            int idx = proc.currentBank().duplicatePattern();
+            if (idx >= 0) proc.currentBank().select(idx);
+        }
         refreshPatternSelector();
         grid.recalcSize(); grid.repaint();
     };
     delPatBtn.onClick = [this] {
-        proc.currentBank().deletePattern(proc.currentBank().currentIndex);
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            proc.currentBank().deletePattern(proc.currentBank().currentIndex);
+        }
         refreshPatternSelector();
         grid.recalcSize(); grid.repaint();
     };
     stepsMinBtn.onClick  = [this] {
-        if (auto* pp = proc.currentBank().current()) {
-            pp->setSteps(pp->numSteps - 1); grid.recalcSize(); grid.repaint(); refreshStepsLabel();
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            if (auto* pp = proc.currentBank().current())
+                pp->setSteps(pp->numSteps - 1);
         }
+        grid.recalcSize(); grid.repaint(); refreshStepsLabel();
     };
     stepsPlusBtn.onClick = [this] {
-        if (auto* pp = proc.currentBank().current()) {
-            pp->setSteps(pp->numSteps + 1); grid.recalcSize(); grid.repaint(); refreshStepsLabel();
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            if (auto* pp = proc.currentBank().current())
+                pp->setSteps(pp->numSteps + 1);
         }
+        grid.recalcSize(); grid.repaint(); refreshStepsLabel();
     };
 
     subdivSelector.addItem("1/4",   1);
@@ -1214,11 +1280,13 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         // Steps per beat:
         // 1/4=1, 1/8=2, 1/8T=3, 1/16=4, 1/16T=6, 1/32=8, 1/32T=12
         int divs[] = {1, 2, 3, 4, 6, 8, 12};
-        if (auto* pp = proc.currentBank().current()) {
-            pp->subdiv = divs[subdivSelector.getSelectedId() - 1];
-            grid.recalcSize();
-            grid.repaint();
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            if (auto* pp = proc.currentBank().current())
+                pp->subdiv = divs[subdivSelector.getSelectedId() - 1];
         }
+        grid.recalcSize();
+        grid.repaint();
     };
 
     // ========== Song ==========
@@ -1246,14 +1314,25 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         "to scroll/edit the song manually while it's running.");
 
     songModeBtn.onClick = [this] { proc.songModeActive = songModeBtn.getToggleState(); };
+    // Song block edits must hold dataLock: advanceStep() reads
+    // song.blocks on the clock threads inside its own locked region.
     addBlockBtn.onClick = [this] {
-        proc.song.addBlock(proc.currentBank().currentIndex);
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            proc.song.addBlock(proc.currentBank().currentIndex);
+        }
         updateSongTimelineSize();
         songTimeline.repaint();
     };
     remBlockBtn.onClick = [this] {
         if (songTimeline.selectedBlock >= 0) {
-            proc.song.removeBlock(songTimeline.selectedBlock);
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                proc.song.removeBlock(songTimeline.selectedBlock);
+                // Keep the player inside the shrunken song
+                if (proc.songPlayer.currentBlock >= (int)proc.song.blocks.size())
+                    proc.songPlayer.reset();
+            }
             songTimeline.selectedBlock = -1;
             updateSongTimelineSize();
             songTimeline.repaint();
@@ -1261,13 +1340,17 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     };
     dupBlockBtn.onClick = [this] {
         if (songTimeline.selectedBlock >= 0) {
-            proc.song.duplicateBlock(songTimeline.selectedBlock);
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                proc.song.duplicateBlock(songTimeline.selectedBlock);
+            }
             updateSongTimelineSize();
             songTimeline.repaint();
         }
     };
     repPlusBtn.onClick = [this] {
         int idx = songTimeline.selectedBlock;
+        const juce::ScopedLock l(proc.dataLock);
         if (idx >= 0 && idx < (int)proc.song.blocks.size()) {
             proc.song.blocks[idx].repeats++;
             songTimeline.repaint();
@@ -1275,6 +1358,7 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     };
     repMinusBtn.onClick = [this] {
         int idx = songTimeline.selectedBlock;
+        const juce::ScopedLock l(proc.dataLock);
         if (idx >= 0 && idx < (int)proc.song.blocks.size()) {
             auto& r = proc.song.blocks[idx].repeats;
             if (r > 1) r--;
@@ -1484,8 +1568,7 @@ void DMXControllerEditor::paint(Graphics& g) {
 bool DMXControllerEditor::keyPressed(const KeyPress& key) {
     // Esc → panic blackout
     if (key == KeyPress::escapeKey) {
-        proc.panicBlackout();
-        blackoutBtn.setToggleState(true, dontSendNotification);
+        proc.panicBlackout();   // latches the Blackout param → button follows
         return true;
     }
 
@@ -1499,7 +1582,7 @@ bool DMXControllerEditor::keyPressed(const KeyPress& key) {
 
     int num = key.getTextCharacter() - '1';
     if (num >= 0 && num < (int)proc.currentBank().patterns.size()) {
-        proc.currentBank().select(num);
+        proc.selectPatternNotifyingHost(num);
         refreshPatternSelector();
         grid.recalcSize();
         grid.repaint();
@@ -1533,7 +1616,7 @@ void DMXControllerEditor::timerCallback() {
     //    break the host-tempo mirror. The slider's onValueChange lambda
     //    refuses to write proc.bpm when clockSource == 1, so any
     //    accidental drag is a no-op.
-    if (proc.clockSource.load() == 1) {
+    if (proc.clockSource.load() >= 1) {   // MIDI Clock or Host Sync
         const double shown = proc.hostBpm.load();
         if (std::abs(bpmSlider.getValue() - shown) > 0.01)
             bpmSlider.setValue(shown, dontSendNotification);
@@ -1555,8 +1638,29 @@ void DMXControllerEditor::timerCallback() {
         }
     }
 
-    blackoutBtn.setToggleState(proc.blackoutActive.load(), dontSendNotification);
+    // (blackoutBtn is driven by its parameter attachment now)
     midiLearnBtn.setToggleState(proc.midiLearnActive.load(), dontSendNotification);
+
+    // Mirror a MIDI-mapped Brightness CC into the slider + grid. The
+    // slider's onValueChange writes the same value back to brightnessLive,
+    // so this converges instead of looping.
+    {
+        const float live = proc.brightnessLive.load();
+        if (std::abs((float)brightnessSlider.getValue() - live) > 0.005f)
+            brightnessSlider.setValue(live, sendNotificationSync);
+    }
+
+    // A scene loaded via a MIDI mapping replaces fixtures/patterns behind
+    // the editor's back — refresh all controls when that happens.
+    {
+        const int count = proc.sceneLoadBroadcast.load();
+        if (count != lastSceneLoadCount_) {
+            lastSceneLoadCount_ = count;
+            refreshFixtureSelector();
+            applyFixtureEdit();
+            refreshAll();
+        }
+    }
     {
         int wantId = proc.autoResetMode.load() + 1;
         if (autoResetSelector.getSelectedId() != wantId)
@@ -1671,26 +1775,21 @@ void DMXControllerEditor::applyFixtureEdit() {
 void DMXControllerEditor::selectColor(int idx) {
     if (idx < 0 || idx >= NUM_PRESET_COLORS) return;
 
-    // FLOOD mode: clicks go to the flood buffer instead of the paint colour
+    // FLOOD mode: clicks go to the flood parameters instead of the paint
+    // colour (the parameters mirror into the atomics and push a preview)
     if (proc.floodMode.load()) {
         const bool isEraseColor = (idx == NUM_PRESET_COLORS - 1);
         if (isEraseColor) {
             // Clicking the "off/black" tile turns the flood off (not a black flood)
-            proc.floodActive.store(false);
-            proc.floodColor.store(0);
+            proc.setFloodParams(false, -1);
         } else {
-            const auto newColor = PRESET_COLORS[idx];
-            const uint32_t packed = packFloodColor(newColor);
+            const uint32_t packed = packFloodColor(PRESET_COLORS[idx]);
             // Toggle off if clicking the same colour that's already flooding
-            if (proc.floodActive.load() && proc.floodColor.load() == packed) {
-                proc.floodActive.store(false);
-                proc.floodColor.store(0);
-            } else {
-                proc.floodColor.store(packed);
-                proc.floodActive.store(true);
-            }
+            if (proc.floodActive.load() && proc.floodColor.load() == packed)
+                proc.setFloodParams(false, -1);
+            else
+                proc.setFloodParams(true, idx);
         }
-        proc.pushPreview();
         grid.repaint();
         barPreview.repaint();
         return;
@@ -1773,6 +1872,7 @@ void DMXControllerEditor::showGeneratorMenu() {
 
     m.showMenuAsync(PopupMenu::Options().withTargetComponent(genBtn),
         [this](int result) {
+            const juce::ScopedLock lock(proc.dataLock);
             auto* pat = proc.currentBank().current();
             if (!pat) return;
             proc.snapshot();
@@ -2027,7 +2127,7 @@ void DMXControllerEditor::showGeneratorMenu() {
                 }
                 case 32: {
                     // Matrix rain — green drips falling through columns
-                    juce::Random r(42);
+                    juce::Random r;   // time-seeded, like the other random generators
                     pat->fillAll({0,0,0});
                     int nDrops = std::max(1, segs / 2);
                     for (int d = 0; d < nDrops; d++) {

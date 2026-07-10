@@ -67,9 +67,17 @@ notarise_bundle () {
     ditto -c -k --keepParent "${bundle}" "${zip}"
 
     echo ">>> Submitting ${name} to notarytool (this can take a few minutes)"
-    xcrun notarytool submit "${zip}" \
+    # notarytool can exit 0 even when the verdict is "Invalid", so check
+    # the reported status explicitly instead of failing later at staple.
+    local submit_out
+    submit_out="$(xcrun notarytool submit "${zip}" \
         --keychain-profile "${NOTARY_PROFILE}" \
-        --wait
+        --wait 2>&1 | tee /dev/stderr)"
+    if ! grep -q "status: Accepted" <<< "${submit_out}"; then
+        echo "!!! Notarisation of ${name} was not accepted — see log above" >&2
+        echo "    (xcrun notarytool log <submission-id> --keychain-profile ${NOTARY_PROFILE})" >&2
+        exit 1
+    fi
 
     echo ">>> Stapling ${name}"
     xcrun stapler staple "${bundle}"
@@ -136,9 +144,13 @@ pkgbuild \
 # 4. Notarise + staple the .pkg
 # ============================================================
 echo ">>> Submitting ${PKG_PATH} to notarytool (this can take a few minutes)"
-xcrun notarytool submit "${PKG_PATH}" \
+PKG_SUBMIT_OUT="$(xcrun notarytool submit "${PKG_PATH}" \
     --keychain-profile "${NOTARY_PROFILE}" \
-    --wait
+    --wait 2>&1 | tee /dev/stderr)"
+if ! grep -q "status: Accepted" <<< "${PKG_SUBMIT_OUT}"; then
+    echo "!!! Notarisation of ${PKG_PATH} was not accepted — see log above" >&2
+    exit 1
+fi
 
 echo ">>> Stapling ${PKG_PATH}"
 xcrun stapler staple "${PKG_PATH}"

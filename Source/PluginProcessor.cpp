@@ -6,10 +6,48 @@
 #include <algorithm>
 
 // ============================================================================
+// Parameter helpers
+// ============================================================================
+static uint32_t packRgb(RGBColor c) {
+    return (((uint32_t)c.r) << 16) | (((uint32_t)c.g) << 8) | (uint32_t)c.b;
+}
+
+juce::AudioProcessorValueTreeState::ParameterLayout
+DMXControllerProcessor::createParameterLayout() {
+    using namespace juce;
+    AudioProcessorValueTreeState::ParameterLayout layout;
+
+    layout.add(std::make_unique<AudioParameterFloat>(
+        ParameterID{"masterDim", 1}, "Master Dimmer",
+        NormalisableRange<float>(0.0f, 1.0f, 0.0f), 1.0f));
+    layout.add(std::make_unique<AudioParameterFloat>(
+        ParameterID{"hueShift", 1}, "Hue Shift",
+        NormalisableRange<float>(-180.0f, 180.0f, 0.0f), 0.0f));
+    // DAW-style swing: 50% = straight, 75% = full triplet feel
+    layout.add(std::make_unique<AudioParameterFloat>(
+        ParameterID{"swing", 1}, "Swing",
+        NormalisableRange<float>(50.0f, 75.0f, 0.0f), 50.0f));
+    layout.add(std::make_unique<AudioParameterBool>(
+        ParameterID{"blackout", 1}, "Blackout", false));
+    layout.add(std::make_unique<AudioParameterBool>(
+        ParameterID{"floodActive", 1}, "Flood", false));
+    // Matches PRESET_COLORS[0..8] (black/off is not a flood colour)
+    layout.add(std::make_unique<AudioParameterChoice>(
+        ParameterID{"floodColor", 1}, "Flood Colour",
+        StringArray{"Red", "Orange", "Yellow", "Green", "Cyan",
+                    "Blue", "Purple", "Pink", "White"}, 8));
+    layout.add(std::make_unique<AudioParameterInt>(
+        ParameterID{"pattern", 1}, "Pattern", 1, 16, 1));
+
+    return layout;
+}
+
+// ============================================================================
 // Construction
 // ============================================================================
 DMXControllerProcessor::DMXControllerProcessor()
-    : AudioProcessor(BusesProperties())
+    : AudioProcessor(BusesProperties()),
+      apvts(*this, nullptr, "PARAMS", createParameterLayout())
 {
     std::memset(dmxState_,     0, sizeof(dmxState_));
     std::memset(prevDmxState_, -1, sizeof(prevDmxState_));
@@ -20,9 +58,27 @@ DMXControllerProcessor::DMXControllerProcessor()
     UserProfileStore::loadOnce();
 
     fixtures.emplace_back("Fixture 1", 8, 0, 0);
+
+    // Cache parameter pointers and mirror every parameter change into the
+    // realtime-read atomics via parameterChanged().
+    pMasterDim_   = dynamic_cast<juce::AudioParameterFloat*> (apvts.getParameter("masterDim"));
+    pHue_         = dynamic_cast<juce::AudioParameterFloat*> (apvts.getParameter("hueShift"));
+    pSwing_       = dynamic_cast<juce::AudioParameterFloat*> (apvts.getParameter("swing"));
+    pBlackout_    = dynamic_cast<juce::AudioParameterBool*>  (apvts.getParameter("blackout"));
+    pFloodActive_ = dynamic_cast<juce::AudioParameterBool*>  (apvts.getParameter("floodActive"));
+    pFloodColor_  = dynamic_cast<juce::AudioParameterChoice*>(apvts.getParameter("floodColor"));
+    pPattern_     = dynamic_cast<juce::AudioParameterInt*>   (apvts.getParameter("pattern"));
+
+    for (auto* id : {"masterDim", "hueShift", "swing", "blackout",
+                     "floodActive", "floodColor", "pattern"})
+        apvts.addParameterListener(id, this);
 }
 
 DMXControllerProcessor::~DMXControllerProcessor() {
+    for (auto* id : {"masterDim", "hueShift", "swing", "blackout",
+                     "floodActive", "floodColor", "pattern"})
+        apvts.removeParameterListener(id, this);
+    cancelPendingUpdate();
     stopTimer();
     {
         const juce::ScopedLock l(midiInLock_);
@@ -33,6 +89,57 @@ DMXControllerProcessor::~DMXControllerProcessor() {
         const juce::ScopedLock l(midiOutLock_);
         directMidiOut_.reset();
     }
+}
+
+// ============================================================================
+// Parameter change handling — parameters are the host-facing truth; every
+// change is mirrored into the realtime-read atomics here. Can be called
+// from any thread (host automation runs on the audio thread).
+// ============================================================================
+void DMXControllerProcessor::parameterChanged(const juce::String& id, float v) {
+    if      (id == "masterDim")   masterDimmer.store(v);
+    else if (id == "hueShift")    hueShiftDeg.store(v);
+    else if (id == "swing")       swing.store((v - 50.0f) * 0.02f);   // 50..75% → 0..0.5
+    else if (id == "blackout")    blackoutActive.store(v >= 0.5f);
+    else if (id == "floodActive") floodActive.store(v >= 0.5f);
+    else if (id == "floodColor") {
+        const int i = (int)std::lround(v);
+        if (i >= 0 && i < NUM_PRESET_COLORS - 1)   // exclude black
+            floodColor.store(packRgb(PRESET_COLORS[i]));
+    }
+    else if (id == "pattern")     selectPatternWithCrossfade((int)std::lround(v) - 1);
+
+    // Push a live preview from the message thread so hardware follows
+    // parameter moves even while transport is stopped.
+    previewDirty_.store(true);
+    triggerAsyncUpdate();
+}
+
+void DMXControllerProcessor::syncAtomicsFromParams() {
+    if (pMasterDim_)   masterDimmer.store(pMasterDim_->get());
+    if (pHue_)         hueShiftDeg.store(pHue_->get());
+    if (pSwing_)       swing.store((pSwing_->get() - 50.0f) * 0.02f);
+    if (pBlackout_)    blackoutActive.store(pBlackout_->get());
+    if (pFloodActive_) floodActive.store(pFloodActive_->get());
+    if (pFloodColor_) {
+        const int i = pFloodColor_->getIndex();
+        if (i >= 0 && i < NUM_PRESET_COLORS - 1)
+            floodColor.store(packRgb(PRESET_COLORS[i]));
+    }
+}
+
+void DMXControllerProcessor::selectPatternNotifyingHost(int idx) {
+    selectPatternWithCrossfade(idx);
+    if (pPattern_ && idx >= 0 && idx < 16)
+        pPattern_->setValueNotifyingHost(pPattern_->convertTo0to1((float)(idx + 1)));
+}
+
+void DMXControllerProcessor::setFloodParams(bool active, int colorIdx) {
+    if (pFloodColor_ && colorIdx >= 0 && colorIdx < NUM_PRESET_COLORS - 1)
+        pFloodColor_->setValueNotifyingHost(
+            pFloodColor_->convertTo0to1((float)colorIdx));
+    if (pFloodActive_)
+        pFloodActive_->setValueNotifyingHost(active ? 1.0f : 0.0f);
 }
 
 PatternBank& DMXControllerProcessor::currentBank() {
@@ -104,6 +211,13 @@ juce::StringArray DMXControllerProcessor::getMidiOutputDeviceNames() {
 
 void DMXControllerProcessor::setMidiOutputDevice(const juce::String& name) {
     const juce::ScopedLock l(midiOutLock_);
+
+    // No-op when the requested device is already open. Opening a MIDI
+    // device can be slow, and callers like setStateInformation re-apply
+    // the saved name on every state load.
+    if (name == currentMidiOutName_ && (directMidiOut_ != nullptr || name.isEmpty()))
+        return;
+
     directMidiOut_.reset();
     currentMidiOutName_ = {};
 
@@ -133,6 +247,12 @@ juce::StringArray DMXControllerProcessor::getMidiInputDeviceNames() {
 
 void DMXControllerProcessor::setMidiInputDevice(const juce::String& name) {
     const juce::ScopedLock l(midiInLock_);
+
+    // No-op when the requested device is already open (see note in
+    // setMidiOutputDevice).
+    if (name == currentMidiInName_ && (directMidiIn_ != nullptr || name.isEmpty()))
+        return;
+
     if (directMidiIn_) directMidiIn_->stop();
     directMidiIn_.reset();
     currentMidiInName_ = {};
@@ -164,51 +284,126 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
 {
     buffer.clear();
 
-    // Parse incoming MIDI from the host (always)
-    for (auto metadata : midi)
-        parseIncomingMidi(metadata.getMessage());
-    midi.clear();
-
     // ---- Host transport tracking (for auto-reset on DAW stop) ----
     // We don't sync step timing to the host — only watch the isPlaying
     // transition so that pressing STOP in the DAW can reset the pattern
     // when Auto-reset is enabled.
-    bool hostPlaying = false;
+    bool   hostPlaying = false;
+    bool   havePpq     = false;
+    double ppq         = 0.0;
     if (auto* ph = getPlayHead()) {
         if (auto pos = ph->getPosition()) {
             hostPlaying = pos->getIsPlaying();
-            // Expose the host tempo so the editor can mirror it when
-            // the plugin is running in MIDI Clock mode.
+            // Expose the host tempo so the editor can mirror it when the
+            // plugin is running in MIDI Clock or Host Sync mode.
             if (auto hostBpmOpt = pos->getBpm())
                 hostBpm.store(*hostBpmOpt);
-        }
-    }
-    hostIsPlaying_.store(hostPlaying);
-
-    if (prevHostPlaying_ && !hostPlaying) {
-        // DAW transport just stopped
-        const int mode = autoResetMode.load();
-        if (mode != 0) {
-            const juce::ScopedLock l(dataLock);
-            for (auto& fix : fixtures) {
-                int last = 0;
-                if (auto* pat = fix.patternBank.current())
-                    last = std::max(0, pat->numSteps - 1);
-                int target = (mode == 2) ? last : 0;
-                fix.patternBank.currentStep = target;
+            if (auto ppqOpt = pos->getPpqPosition()) {
+                ppq     = *ppqOpt;
+                havePpq = true;
             }
-            // Sync the global step to the active fixture's target
-            if (activeFixture >= 0 && activeFixture < (int)fixtures.size())
-                currentStep.store(fixtures[activeFixture].patternBank.currentStep);
-            sampleCounter_ = 0.0;
-            prevHostStep_  = -1;
-            midiClockCount_ = 0;
-            if (songModeActive) songPlayer.reset();
-            computeDmxState();
-            emitDmxDelta(nullptr, 0);
         }
     }
-    prevHostPlaying_ = hostPlaying;
+
+    // DMX note deltas generated during this block (MIDI-clock-driven step
+    // advances, transport resets) are collected here and handed back to
+    // the host, so the plugin's declared MIDI output actually carries the
+    // DMX stream — not just the direct device connection.
+    juce::MidiBuffer generated;
+
+    {
+        const juce::ScopedLock l(dataLock);
+        hostMidiOut_   = &generated;
+        hostSamplePos_ = 0;
+
+        // Parse incoming MIDI from the host (always)
+        for (auto metadata : midi) {
+            hostSamplePos_ = metadata.samplePosition;
+            parseIncomingMidi(metadata.getMessage());
+        }
+        hostSamplePos_ = 0;
+
+        // ---- Host Sync (clockSource == 2): sample-accurate PPQ stepping ----
+        // Step boundaries are computed directly from the playhead position,
+        // so steps land exactly on the host grid, tempo changes are followed
+        // instantly, loops/locates re-lock cleanly, and swing shifts odd
+        // steps by an exact fraction of the step length.
+        if (clockSource.load() == 2) {
+            isPlaying.store(hostPlaying);
+            if (hostPlaying && havePpq) {
+                auto* pat = currentBank().current();
+                if (pat && pat->subdiv > 0 && pat->numSteps > 0) {
+                    const double bpmH   = hostBpm.load() > 0.0 ? hostBpm.load() : 120.0;
+                    const double srate  = sampleRate_ > 0.0 ? sampleRate_ : 44100.0;
+                    const double ppqPerSample = bpmH / 60.0 / srate;
+                    const double sw     = (double)swing.load();     // 0..0.5
+                    const int    subdiv = pat->subdiv;
+
+                    // Step n starts at (n + sw for odd n) / subdiv quarter-notes.
+                    auto stepStartPpq = [subdiv, sw](juce::int64 n) {
+                        return ((double)n + ((n & 1) ? sw : 0.0)) / (double)subdiv;
+                    };
+                    // Inverse: which step is sounding at PPQ position p.
+                    auto stepAtPpq = [subdiv, sw](double p) {
+                        auto k = (juce::int64)std::floor(p * subdiv);
+                        const double frac = p * (double)subdiv - (double)k;
+                        if ((k & 1) && frac < sw) --k;   // odd step delayed by swing
+                        return k;
+                    };
+
+                    const double      blockEnd = ppq + ppqPerSample * buffer.getNumSamples();
+                    const juce::int64 stepNow  = stepAtPpq(ppq);
+
+                    // Re-lock on start, backward jumps (loop) or big forward
+                    // jumps (locate) instead of replaying every skipped step.
+                    if (!hostStepValid_
+                        || lastHostStep_ > stepNow
+                        || stepNow - lastHostStep_ > 4) {
+                        lastHostStep_  = stepNow - 1;
+                        hostStepValid_ = true;
+                    }
+
+                    for (juce::int64 n = lastHostStep_ + 1; stepStartPpq(n) < blockEnd; ++n) {
+                        const double off = (stepStartPpq(n) - ppq) / ppqPerSample;
+                        hostSamplePos_ = juce::jlimit(0, juce::jmax(0, buffer.getNumSamples() - 1),
+                                                      (int)std::llround(off));
+                        applyHostStep(n);
+                        lastHostStep_ = n;
+                    }
+                    hostSamplePos_ = 0;
+                }
+            } else {
+                hostStepValid_ = false;
+            }
+        }
+
+        if (prevHostPlaying_ && !hostPlaying) {
+            // DAW transport just stopped
+            const int mode = autoResetMode.load();
+            if (mode != 0) {
+                for (auto& fix : fixtures) {
+                    int last = 0;
+                    if (auto* pat = fix.patternBank.current())
+                        last = std::max(0, pat->numSteps - 1);
+                    int target = (mode == 2) ? last : 0;
+                    fix.patternBank.currentStep = target;
+                }
+                // Sync the global step to the active fixture's target
+                if (activeFixture >= 0 && activeFixture < (int)fixtures.size())
+                    currentStep.store(fixtures[activeFixture].patternBank.currentStep);
+                sampleCounter_ = 0.0;
+                midiClockCount_.store(0);
+                if (songModeActive) songPlayer.reset();
+                computeDmxState();
+                emitDmxDelta(nullptr, 0);
+            }
+        }
+        prevHostPlaying_ = hostPlaying;
+
+        hostMidiOut_ = nullptr;
+    }
+
+    midi.swapWith(generated);
 }
 
 // ============================================================================
@@ -219,11 +414,11 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
 
     // MIDI Clock (24 ppqn) — only when in MIDI Clock mode
     if (msg.isMidiClock() && src == 1 && isPlaying.load()) {
-        midiClockCount_++;
+        const int clockCount = ++midiClockCount_;
         const juce::ScopedLock l(dataLock);
         if (auto* pat = currentBank().current()) {
             int clocksPerStep = std::max(1, (int)std::round(24.0 / pat->subdiv));
-            if (midiClockCount_ % clocksPerStep == 0) {
+            if (clockCount % clocksPerStep == 0) {
                 advanceStep();
                 computeDmxState();
                 emitDmxDelta(nullptr, 0);
@@ -256,8 +451,7 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
                     currentStep.store(0);
             }
             isPlaying.store(true);
-            midiClockCount_ = 0;
-            needsInitialSend.store(true);
+            midiClockCount_.store(0);
             return;
         }
         if (msg.isMidiStop())     {
@@ -279,8 +473,7 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
                 else
                     currentStep.store(0);
                 sampleCounter_  = 0.0;
-                prevHostStep_   = -1;
-                midiClockCount_ = 0;
+                midiClockCount_.store(0);
                 if (songModeActive) songPlayer.reset();
                 computeDmxState();
                 emitDmxDelta(nullptr, 0);
@@ -290,8 +483,14 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
         if (msg.isMidiContinue()) { isPlaying.store(true);  return; }
     }
 
-    // Note / CC / PC — always used for learn + triggers
+    // Note / CC / PC — always used for learn + triggers.
+    // This whole section runs under dataLock: parseIncomingMidi is called
+    // from both the audio thread (host MIDI) and the direct MIDI-input
+    // callback thread, and the learn path mutates midiMappings while the
+    // dispatch loop iterates it. The lock is recursive, so the pattern
+    // mutations below can take it again safely.
     if (msg.isNoteOn() || msg.isController() || msg.isProgramChange()) {
+        const juce::ScopedLock lock(dataLock);
         int type  = msg.isNoteOn() ? 0x90 : (msg.isController() ? 0xB0 : 0xC0);
         int data1 = msg.isNoteOn()      ? msg.getNoteNumber()
                   : msg.isController()  ? msg.getControllerNumber()
@@ -316,34 +515,36 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
             if (m.msgType != type || m.data1 != data1) continue;
             float norm = value / 127.0f;
             switch (m.target) {
+                // Continuous targets route through the PARAMETERS (not the
+                // atomics) so host automation lanes and the UI stay in sync
+                // with MIDI-learned controllers.
                 case MidiTarget::PatternSelect:
-                    currentBank().select(m.param);
+                    selectPatternNotifyingHost(m.param);
                     break;
                 case MidiTarget::BpmCC:
-                    bpm = 40.0 + norm * 260.0;  // 40..300
+                    bpm.store(40.0 + norm * 260.0);  // 40..300
                     break;
                 case MidiTarget::BrightnessCC:
                     brightnessLive.store(norm);
                     break;
                 case MidiTarget::MasterDimCC:
-                    masterDimmer.store(norm);
+                    if (pMasterDim_) pMasterDim_->setValueNotifyingHost(norm);
                     break;
                 case MidiTarget::HueCC:
-                    hueShiftDeg.store((norm - 0.5f) * 360.0f);
+                    if (pHue_) pHue_->setValueNotifyingHost(norm);
                     break;
                 case MidiTarget::SatCC:
                     // Saturation removed from UI — no-op (kept for MIDI map back-compat)
                     break;
                 case MidiTarget::SwingCC:
-                    swing.store(norm * 0.5f);
+                    if (pSwing_) pSwing_->setValueNotifyingHost(norm);
                     break;
                 case MidiTarget::BlackoutToggle:
-                    if (msg.isNoteOn())
-                        blackoutActive.store(!blackoutActive.load());
+                    if (msg.isNoteOn() && pBlackout_)
+                        pBlackout_->setValueNotifyingHost(pBlackout_->get() ? 0.0f : 1.0f);
                     break;
                 case MidiTarget::FillAll:
                     if (msg.isNoteOn()) {
-                        const juce::ScopedLock l(dataLock);
                         if (auto* pat = currentBank().current())
                             pat->fillAll({255,255,255});
                     }
@@ -351,13 +552,18 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
                 case MidiTarget::Generate:
                     // Simple: trigger chase with white
                     if (msg.isNoteOn()) {
-                        const juce::ScopedLock l(dataLock);
                         if (auto* pat = currentBank().current())
                             *pat = Pattern::chase(pat->numSteps, pat->numSegments, {255,255,255});
                     }
                     break;
                 case MidiTarget::SceneLoad:
-                    if (msg.isNoteOn()) loadScene(m.param);
+                    // loadScene runs setStateInformation (XML parse, heavy
+                    // allocation, MIDI device open) — far too heavy for the
+                    // audio / MIDI threads. Defer to the message thread.
+                    if (msg.isNoteOn()) {
+                        pendingSceneLoad_.store(m.param);
+                        triggerAsyncUpdate();
+                    }
                     break;
                 case MidiTarget::Panic:
                     if (msg.isNoteOn()) panicBlackout();
@@ -370,12 +576,14 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
 }
 
 void DMXControllerProcessor::beginMidiLearn(MidiTarget target, int param) {
+    const juce::ScopedLock l(dataLock);
     midiLearnTargetType  = target;
     midiLearnTargetParam = param;
     midiLearnActive.store(true);
 }
 
 void DMXControllerProcessor::clearMidiMapping(MidiTarget target, int param) {
+    const juce::ScopedLock l(dataLock);
     midiMappings.erase(std::remove_if(midiMappings.begin(), midiMappings.end(),
         [target, param](const MidiMapping& m) {
             return m.target == target && m.param == param;
@@ -383,9 +591,24 @@ void DMXControllerProcessor::clearMidiMapping(MidiTarget target, int param) {
 }
 
 bool DMXControllerProcessor::findMappingFor(MidiTarget target, int param, MidiMapping& out) const {
+    const juce::ScopedLock l(dataLock);
     for (const auto& m : midiMappings)
         if (m.target == target && m.param == param) { out = m; return true; }
     return false;
+}
+
+// ============================================================================
+// Deferred scene load (message thread) — see MidiTarget::SceneLoad above
+// ============================================================================
+void DMXControllerProcessor::handleAsyncUpdate() {
+    const int idx = pendingSceneLoad_.exchange(-1);
+    if (idx >= 0 && loadScene(idx))
+        sceneLoadBroadcast++;   // editor timer notices and refreshes
+
+    // Parameter moves (automation, attachments, MIDI-learn) request a live
+    // preview so the hardware follows even while transport is stopped.
+    if (previewDirty_.exchange(false))
+        pushPreview();
 }
 
 // ============================================================================
@@ -399,16 +622,19 @@ void DMXControllerProcessor::hiResTimerCallback() {
         advanceStep();
         computeDmxState();
         emitDmxDelta(nullptr, 0);
+        // Must stay inside the lock: updateClockTimer dereferences the
+        // current pattern, which the UI can reassign / resize.
+        updateClockTimer();
     }
-
-    updateClockTimer();
 }
 
 void DMXControllerProcessor::updateClockTimer() {
+    const juce::ScopedLock l(dataLock);
     auto* pat = currentBank().current();
-    if (!pat || bpm <= 0.0 || pat->subdiv <= 0) return;
+    const double bpmNow = bpm.load();
+    if (!pat || bpmNow <= 0.0 || pat->subdiv <= 0) return;
 
-    double stepMs = 60000.0 / (bpm * pat->subdiv);
+    double stepMs = 60000.0 / (bpmNow * pat->subdiv);
 
     // Swing: odd-indexed steps are delayed by (swing * stepMs).
     // So the interval before firing an odd step is longer; before firing
@@ -437,12 +663,60 @@ void DMXControllerProcessor::advanceStep() {
         if (continues) {
             int newPat = songPlayer.getCurrentPatternIndex(song);
             if (newPat != currentBank().currentIndex)
-                currentBank().select(newPat);
+                selectPatternWithCrossfade(newPat);
         } else if (!song.loop) {
             isPlaying.store(false);
             stopTimer();
         }
     }
+}
+
+// ============================================================================
+// Host Sync step application — caller holds dataLock (processBlock)
+// ============================================================================
+void DMXControllerProcessor::applyHostStep(juce::int64 globalStep) {
+    auto* pat = currentBank().current();
+    if (!pat || pat->numSteps <= 0) return;
+
+    const int len     = pat->numSteps;
+    const int newStep = (int)(((globalStep % len) + len) % len);
+    currentStep.store(newStep);
+    currentBank().currentStep = newStep;
+
+    // Song mode: advance the chain each time the active pattern wraps to
+    // step 0, mirroring advanceStep(). A finished non-looping song simply
+    // holds — we never stop the host's transport.
+    if (songModeActive && newStep == 0) {
+        if (songPlayer.advanceBlock(song)) {
+            int newPat = songPlayer.getCurrentPatternIndex(song);
+            if (newPat != currentBank().currentIndex)
+                selectPatternWithCrossfade(newPat);
+        }
+    }
+
+    computeDmxState();
+    emitDmxDelta(nullptr, 0);
+}
+
+// ============================================================================
+// Pattern selection with crossfade capture
+// ============================================================================
+void DMXControllerProcessor::selectPatternWithCrossfade(int idx) {
+    const juce::ScopedLock l(dataLock);
+    auto& bank = currentBank();
+    if (idx < 0 || idx >= (int)bank.patterns.size() || idx == bank.currentIndex)
+        return;
+
+    // Capture the outgoing pattern's colours at the current step so
+    // applyCrossfade() can blend from them into the new pattern.
+    if (crossfadeSteps.load() > 0) {
+        if (auto* oldPat = bank.current()) {
+            const int steps = std::max(1, oldPat->numSteps);
+            crossfadeFrom_     = oldPat->getStepColors(currentStep.load() % steps);
+            crossfadeProgress_ = 0;
+        }
+    }
+    bank.select(idx);
 }
 
 // ============================================================================
@@ -494,7 +768,10 @@ void DMXControllerProcessor::computeDmxState() {
         return c;
     };
 
-    for (auto& fixture : fixtures) {
+    const int activeFix = activeFixture.load();
+
+    for (int fi = 0; fi < (int)fixtures.size(); ++fi) {
+        auto& fixture = fixtures[fi];
         std::vector<RGBColor> colors;
         if (flood) {
             // FLOOD is an ALL-fixtures override. Every fixture in the rig
@@ -506,8 +783,16 @@ void DMXControllerProcessor::computeDmxState() {
         } else {
             auto* pat = fixture.patternBank.current();
             if (!pat) continue;      // normal playback still needs a pattern
-            colors = pat->getStepColors(step);
-            colors = applyCrossfade(colors);
+            // Wrap the global step counter into this fixture's own pattern
+            // length — otherwise fixtures with shorter patterns than the
+            // active one render out-of-range (black) instead of looping.
+            const int fixStep = (pat->numSteps > 0) ? step % pat->numSteps : 0;
+            colors = pat->getStepColors(fixStep);
+            // Crossfade blends the ACTIVE fixture's pattern change; it's
+            // applied to that fixture only so crossfadeProgress_ advances
+            // exactly once per computed frame.
+            if (fi == activeFix)
+                colors = applyCrossfade(colors);
         }
 
         // Apply hue shift (skipped for flood so the chosen colour stays
@@ -551,6 +836,10 @@ void DMXControllerProcessor::emitDmxDelta(juce::MidiBuffer* buf, int sampleOffse
             : juce::MidiMessage::noteOff(midiChannel, ch);
 
         if (buf) buf->addEvent(m, sampleOffset);
+        // While processBlock is running (hostMidiOut_ set under dataLock,
+        // which every caller of emitDmxDelta holds), also feed the host's
+        // MIDI output so DAW-side routing receives the DMX stream.
+        if (hostMidiOut_) hostMidiOut_->addEvent(m, hostSamplePos_);
         if (directMidiOut_) directMidiOut_->sendMessageNow(m);
     }
 }
@@ -598,7 +887,6 @@ void DMXControllerProcessor::pushPreview() {
 // ============================================================================
 void DMXControllerProcessor::startPlayback() {
     sampleCounter_ = 0.0;
-    needsInitialSend.store(true);
 
     isPlaying.store(true);
     if (songModeActive) songPlayer.reset();
@@ -637,8 +925,7 @@ void DMXControllerProcessor::stopPlayback() {
         else
             currentStep.store(0);
         sampleCounter_ = 0.0;
-        prevHostStep_  = -1;
-        midiClockCount_ = 0;
+        midiClockCount_.store(0);
         if (songModeActive) songPlayer.reset();
         // Recompute so the grid playhead visibly snaps back into place
         computeDmxState();
@@ -650,7 +937,6 @@ void DMXControllerProcessor::resetPlayback() {
     currentStep.store(0);
     currentBank().reset();
     sampleCounter_ = 0.0;
-    prevHostStep_ = -1;
     if (songModeActive) songPlayer.reset();
 
     computeDmxState();
@@ -661,8 +947,17 @@ void DMXControllerProcessor::resetPlayback() {
 // State persistence
 // ============================================================================
 void DMXControllerProcessor::getStateInformation(juce::MemoryBlock& dest) {
+    writeState(dest, true);
+}
+
+void DMXControllerProcessor::writeState(juce::MemoryBlock& dest, bool includeScenes) {
+    // Hosts can autosave at any time while the clock threads are mutating
+    // patterns (Generate/FillAll mappings, song-mode pattern switches), so
+    // serialisation must hold the same lock as the mutators.
+    const juce::ScopedLock l(dataLock);
+
     auto xml = std::make_unique<juce::XmlElement>("DMXControllerState");
-    xml->setAttribute("bpm",           bpm);
+    xml->setAttribute("bpm",           bpm.load());
     xml->setAttribute("clockSource",   clockSource.load());
     xml->setAttribute("songMode",      songModeActive);
     xml->setAttribute("crossfade",     crossfadeSteps);
@@ -674,6 +969,12 @@ void DMXControllerProcessor::getStateInformation(juce::MemoryBlock& dest) {
     xml->setAttribute("swing",         (double)swing.load());
     xml->setAttribute("autoResetMode", (int)autoResetMode.load());
     xml->setAttribute("floodMode",       (bool)floodMode.load());
+
+    // Host-automatable parameters. The scalar attributes above are still
+    // written so files stay readable by older plugin versions, but PARAMS
+    // is authoritative when loading.
+    if (auto paramsXml = apvts.copyState().createXml())
+        xml->addChildElement(paramsXml.release());
 
     auto* fixXml = xml->createNewChildElement("Fixtures");
     for (auto& fix : fixtures) {
@@ -720,12 +1021,18 @@ void DMXControllerProcessor::getStateInformation(juce::MemoryBlock& dest) {
         mx->setAttribute("param",  m.param);
     }
 
-    auto* scnXml = xml->createNewChildElement("Scenes");
-    for (int i = 0; i < 4; i++) {
-        if (scenes[i].occupied) {
-            auto* s = scnXml->createNewChildElement("S");
-            s->setAttribute("i", i);
-            s->setAttribute("data", scenes[i].data.toBase64Encoding());
+    // Scene snapshots themselves are serialised WITHOUT the scenes table
+    // (includeScenes = false from storeScene) — otherwise every stored
+    // scene embeds the other scenes' blobs and the state grows
+    // geometrically with each store.
+    if (includeScenes) {
+        auto* scnXml = xml->createNewChildElement("Scenes");
+        for (int i = 0; i < 4; i++) {
+            if (scenes[i].occupied) {
+                auto* s = scnXml->createNewChildElement("S");
+                s->setAttribute("i", i);
+                s->setAttribute("data", scenes[i].data.toBase64Encoding());
+            }
         }
     }
 
@@ -736,10 +1043,20 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
     auto xml = getXmlFromBinary(data, sizeInBytes);
     if (!xml || xml->getTagName() != "DMXControllerState") return;
 
+    juce::String savedOut, savedIn;
+
+    // Scoped: the MIDI device re-open below must happen OUTSIDE dataLock.
+    // Opening/stopping a MIDI input can wait for an in-flight input
+    // callback, and that callback may itself be blocked on dataLock —
+    // holding the lock across the device calls risks a deadlock.
+    {
     const juce::ScopedLock l(dataLock);
-    bpm              = xml->getDoubleAttribute("bpm", 120.0);
+    bpm.store(xml->getDoubleAttribute("bpm", 120.0));
     clockSource.store(xml->getIntAttribute("clockSource",
                         xml->getBoolAttribute("internalClock", true) ? 0 : 1));
+    // Mode 2 is Host Sync (the old removed "Sync DAW" value maps onto it,
+    // which is what those legacy saves wanted anyway). Clamp anything else.
+    if (clockSource.load() < 0 || clockSource.load() > 2) clockSource.store(0);
     songModeActive   = xml->getBoolAttribute("songMode", false);
     crossfadeSteps   = xml->getIntAttribute("crossfade", 0);
     activeFixture    = xml->getIntAttribute("activeFixture", 0);
@@ -752,11 +1069,10 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
     else
         autoResetMode.store(xml->getBoolAttribute("autoResetOnStop", false) ? 1 : 0);
     floodMode.store(xml->getBoolAttribute("floodMode", false));
-    // Flood output itself is a transient live state and is NOT restored
-    floodActive.store(false);
-    floodColor.store(0);
-    auto savedOut    = xml->getStringAttribute("midiOutDevice");
-    auto savedIn     = xml->getStringAttribute("midiInDevice");
+    // (floodActive/floodColor are parameters now and restore with PARAMS
+    // below, like any other automatable value.)
+    savedOut = xml->getStringAttribute("midiOutDevice");
+    savedIn  = xml->getStringAttribute("midiInDevice");
 
     if (auto* fixXml = xml->getChildByName("Fixtures")) {
         fixtures.clear();
@@ -806,7 +1122,8 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
         if (fixtures.empty())
             fixtures.emplace_back("Fixture 1", 8, 0, 0);
     }
-    if (activeFixture >= (int)fixtures.size()) activeFixture = 0;
+    if (activeFixture < 0 || activeFixture >= (int)fixtures.size())
+        activeFixture = 0;
 
     if (auto* songXml = xml->getChildByName("Song")) {
         song.loop = songXml->getBoolAttribute("loop", true);
@@ -844,6 +1161,28 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
         }
     }
 
+    } // end ScopedLock(dataLock)
+
+    // ---- Parameters (outside the lock: notifying the host from inside
+    // our own lock is asking for trouble) ----
+    if (auto* paramsXml = xml->getChildByName(apvts.state.getType())) {
+        apvts.replaceState(juce::ValueTree::fromXml(*paramsXml));
+    } else {
+        // Legacy file from before the parameter migration: seed the params
+        // from the old scalar attributes so host + UI show the right values.
+        if (pMasterDim_) pMasterDim_->setValueNotifyingHost(
+            pMasterDim_->convertTo0to1((float)xml->getDoubleAttribute("masterDim", 1.0)));
+        if (pHue_) pHue_->setValueNotifyingHost(
+            pHue_->convertTo0to1((float)xml->getDoubleAttribute("hueShift", 0.0)));
+        if (pSwing_) pSwing_->setValueNotifyingHost(
+            pSwing_->convertTo0to1(50.0f + (float)xml->getDoubleAttribute("swing", 0.0) * 50.0f));
+    }
+    // replaceState doesn't reliably fire listeners — sync explicitly.
+    syncAtomicsFromParams();
+    if (pPattern_) selectPatternWithCrossfade(pPattern_->get() - 1);
+
+    // Device re-open happens outside the lock (see comment above). The
+    // setters no-op when the requested device is already the open one.
     if (savedOut.isNotEmpty()) setMidiOutputDevice(savedOut);
     if (savedIn.isNotEmpty())  setMidiInputDevice(savedIn);
 }
@@ -895,7 +1234,9 @@ bool DMXControllerProcessor::redo() {
 void DMXControllerProcessor::storeScene(int idx) {
     if (idx < 0 || idx >= 4) return;
     juce::MemoryBlock mb;
-    getStateInformation(mb);
+    // includeScenes = false: a scene snapshot must not embed the other
+    // scenes' blobs, or repeated stores balloon the saved state.
+    writeState(mb, false);
     scenes[idx].data = mb;
     scenes[idx].occupied = true;
 }
@@ -930,20 +1271,26 @@ void DMXControllerProcessor::tapTempo() {
         if (avgMs > 0.0) {
             double newBpm = 60000.0 / avgMs;
             newBpm = juce::jlimit(40.0, 300.0, newBpm);
-            bpm = newBpm;
+            bpm.store(newBpm);
             if (isPlaying.load() && clockSource.load() == 0) updateClockTimer();
         }
     }
 }
 
 // ============================================================================
-// Panic blackout — zero all 128 channels, clear blackout flag after
+// Panic blackout — zero all 128 channels and latch blackout ON
+// (the user un-latches it from the BLACKOUT toggle when ready)
 // ============================================================================
 void DMXControllerProcessor::panicBlackout() {
-    const juce::ScopedLock l(dataLock);
-    std::memset(dmxState_, 0, sizeof(dmxState_));
-    emitDmxDelta(nullptr, 0);
-    blackoutActive.store(true);
+    {
+        const juce::ScopedLock l(dataLock);
+        std::memset(dmxState_, 0, sizeof(dmxState_));
+        emitDmxDelta(nullptr, 0);
+        blackoutActive.store(true);
+    }
+    // Latch the Blackout parameter so the UI toggle and any automation
+    // lane reflect the panic state.
+    if (pBlackout_) pBlackout_->setValueNotifyingHost(1.0f);
 }
 
 // ============================================================================
@@ -962,7 +1309,10 @@ void DMXControllerProcessor::duplicateFixture(int idx) {
         if (end > nextDmx) nextDmx = end;
     }
     copy.dmxStart = nextDmx;
-    copy.name = "Fixture " + std::to_string(fixtures.size() + 1);
+    // Keep the source fixture's name so custom names survive duplication;
+    // renumberDefaultFixtures() only touches auto-generated "Fixture N"
+    // names, so "Left Bar copy" stays as the user expects.
+    copy.name = fixtures[idx].name + " copy";
     fixtures.push_back(std::move(copy));
     renumberDefaultFixtures();
 }
@@ -971,6 +1321,7 @@ void DMXControllerProcessor::duplicateFixture(int idx) {
 // Fixture JSON serialize / deserialize
 // ============================================================================
 juce::String DMXControllerProcessor::serializeFixture(int idx) const {
+    const juce::ScopedLock l(dataLock);
     if (idx < 0 || idx >= (int)fixtures.size()) return {};
     const auto& fix = fixtures[idx];
 
@@ -1055,6 +1406,7 @@ bool DMXControllerProcessor::deserializeFixtureInto(int idx, const juce::String&
 // Pattern JSON serialize / deserialize (single pattern within a fixture)
 // ============================================================================
 juce::String DMXControllerProcessor::serializePattern(int fixtureIdx, int patIdx) const {
+    const juce::ScopedLock l(dataLock);
     if (fixtureIdx < 0 || fixtureIdx >= (int)fixtures.size()) return {};
     const auto& fix = fixtures[fixtureIdx];
     if (patIdx < 0 || patIdx >= (int)fix.patternBank.patterns.size()) return {};
@@ -1084,12 +1436,9 @@ bool DMXControllerProcessor::deserializePatternInto(int fixtureIdx, int patIdx, 
     auto& fix = fixtures[fixtureIdx];
     if (patIdx < 0 || patIdx >= (int)fix.patternBank.patterns.size()) return false;
 
-    int steps  = (int)parsed.getProperty("steps",  16);
-    int segs   = (int)parsed.getProperty("segs",   fix.numSegments);
-    int subdiv = (int)parsed.getProperty("subdiv", 4);
-    // Clamp segments to the fixture's actual count — the imported pattern
-    // might have been built for a different fixture.
-    segs = std::min(segs, fix.numSegments);
+    int steps   = (int)parsed.getProperty("steps",  16);
+    int srcSegs = (int)parsed.getProperty("segs",   fix.numSegments);
+    int subdiv  = (int)parsed.getProperty("subdiv", 4);
 
     Pattern pat(
         parsed.getProperty("name", "Pattern").toString().toStdString(),
@@ -1099,10 +1448,15 @@ bool DMXControllerProcessor::deserializePatternInto(int fixtureIdx, int patIdx, 
     juce::StringArray tokens;
     tokens.addTokens(gridStr, ",", "");
     int ti = 0;
+    // Walk the token stream with the SOURCE pattern's segment count —
+    // the grid string holds srcSegs tokens per step. When the imported
+    // pattern has more segments than this fixture, the extras must still
+    // be consumed (and dropped) or every following step's colours shift
+    // sideways into the wrong columns.
     for (int s = 0; s < steps && ti < tokens.size(); s++)
-        for (int seg = 0; seg < segs && ti < tokens.size(); seg++, ti++) {
+        for (int seg = 0; seg < srcSegs && ti < tokens.size(); seg++, ti++) {
             auto hex = tokens[ti].trim();
-            if (hex.length() == 6) {
+            if (hex.length() == 6 && seg < fix.numSegments) {
                 int r = hex.substring(0, 2).getHexValue32();
                 int g = hex.substring(2, 4).getHexValue32();
                 int b = hex.substring(4, 6).getHexValue32();

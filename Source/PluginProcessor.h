@@ -9,7 +9,9 @@
 // ============================================================================
 class DMXControllerProcessor : public juce::AudioProcessor,
                                 private juce::HighResolutionTimer,
-                                private juce::MidiInputCallback
+                                private juce::MidiInputCallback,
+                                private juce::AsyncUpdater,
+                                private juce::AudioProcessorValueTreeState::Listener
 {
 public:
     DMXControllerProcessor();
@@ -42,7 +44,7 @@ public:
     // Public state
     // =======================================================================
     std::vector<FixtureConfig> fixtures;
-    int activeFixture = 0;
+    std::atomic<int> activeFixture {0};
     PatternBank& currentBank();
 
     // Protects mutation / read of `fixtures` and their PatternBanks across
@@ -78,10 +80,11 @@ public:
     // clock out of the box (no "first step skipped" surprise).
     std::atomic<int>  autoResetMode  {2};
     std::atomic<int>  currentStep    {0};
-    std::atomic<bool> needsInitialSend{false};
-    double bpm = 120.0;
+    std::atomic<double> bpm {120.0};
 
-    // Clock source: 0=Internal, 1=MIDI Clock.
+    // Clock source: 0=Internal, 1=MIDI Clock, 2=Host Sync (sample-accurate
+    // PPQ tracking of the DAW playhead; follows tempo changes, loops and
+    // locates, and applies swing exactly on the grid).
     // Default = MIDI Clock since that's the intended use on a MIDI track.
     std::atomic<int>  clockSource{1};
 
@@ -124,10 +127,40 @@ public:
     // Song
     Song       song;
     SongPlayer songPlayer;
-    bool       songModeActive = false;
+    std::atomic<bool> songModeActive {false};
 
-    // Crossfade
-    int crossfadeSteps = 0;
+    // Crossfade (steps over which a pattern change blends from the old
+    // pattern's colours to the new pattern's; 0 = off)
+    std::atomic<int> crossfadeSteps {0};
+
+    // Select a pattern in the active fixture's bank, capturing the outgoing
+    // colours first so applyCrossfade() can blend into the new pattern.
+    // Safe to call from any thread (takes dataLock; recursive).
+    void selectPatternWithCrossfade(int idx);
+
+    // Incremented every time a scene is loaded via a MIDI mapping so the
+    // editor's timer can notice and refresh its controls.
+    std::atomic<int> sceneLoadBroadcast {0};
+
+    // =======================================================================
+    // Host-automatable parameters (APVTS)
+    //
+    // The atomics above (masterDimmer, hueShiftDeg, swing, blackoutActive,
+    // floodActive, floodColor) remain the realtime-read copies; the
+    // parameters are the host-facing source of truth and parameterChanged()
+    // mirrors every change into the corresponding atomic. UI and MIDI-learn
+    // both write through the parameters so host automation always agrees
+    // with what the plugin is doing.
+    // =======================================================================
+    juce::AudioProcessorValueTreeState apvts;
+    static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+    // Select a pattern AND reflect it into the "Pattern" parameter so the
+    // host sees manual selections. Use this from UI / MIDI paths.
+    void selectPatternNotifyingHost(int idx);
+
+    // Set flood state through the parameters (colorIdx -1 = leave colour).
+    void setFloodParams(bool active, int colorIdx);
 
     // ==== Expanded MIDI Learn ====
     enum class MidiTarget : int {
@@ -193,13 +226,49 @@ private:
     // --- audio / timing ---
     double sampleRate_     = 44100.0;
     double sampleCounter_  = 0.0;
-    int    midiClockCount_ = 0;
+    // Atomic: incremented by whichever thread delivers MIDI clock (audio
+    // thread for host MIDI, MIDI-input callback thread for direct devices).
+    std::atomic<int> midiClockCount_ {0};
 
-    // --- host transport tracking (for DAW sync) ---
-    std::atomic<bool>  hostIsPlaying_{false};
-    std::atomic<double> hostBpm_{120.0};
-    int prevHostStep_ = -1;
+    // --- host transport tracking (for auto-reset on DAW stop) ---
     bool prevHostPlaying_ = false;
+
+    // --- Host Sync (clockSource == 2) ---
+    // Index of the last step boundary we emitted, as an UNWRAPPED global
+    // step count derived from the playhead PPQ position. Invalidated on
+    // stop, backward jumps (loops) and large forward jumps (locates) so
+    // playback re-locks to the grid instead of machine-gunning catch-up
+    // steps.
+    juce::int64 lastHostStep_  = -1;
+    bool        hostStepValid_ = false;
+    void applyHostStep(juce::int64 globalStep);   // caller holds dataLock
+
+    // --- APVTS plumbing ---
+    void parameterChanged(const juce::String& parameterID, float newValue) override;
+    void syncAtomicsFromParams();
+    std::atomic<bool> previewDirty_ {false};
+    juce::AudioParameterFloat*  pMasterDim_   = nullptr;
+    juce::AudioParameterFloat*  pHue_         = nullptr;
+    juce::AudioParameterFloat*  pSwing_       = nullptr;
+    juce::AudioParameterBool*   pBlackout_    = nullptr;
+    juce::AudioParameterBool*   pFloodActive_ = nullptr;
+    juce::AudioParameterChoice* pFloodColor_  = nullptr;
+    juce::AudioParameterInt*    pPattern_     = nullptr;
+
+    // --- deferred scene load (MIDI SceneLoad mappings) ---
+    // setStateInformation is far too heavy for the audio / MIDI threads
+    // (XML parse, allocation, MIDI device open), so parseIncomingMidi only
+    // records the request here and triggers an async update; the actual
+    // load happens on the message thread in handleAsyncUpdate().
+    std::atomic<int> pendingSceneLoad_ {-1};
+    void handleAsyncUpdate() override;
+
+    // --- host MIDI output routing ---
+    // Non-null only while processBlock is running (set/cleared under
+    // dataLock). emitDmxDelta additionally writes into this buffer so the
+    // host's MIDI FX chain receives the DMX note stream too.
+    juce::MidiBuffer* hostMidiOut_  = nullptr;
+    int               hostSamplePos_ = 0;
 
     // --- DMX delta tracking ---
     int dmxState_    [128];
@@ -224,6 +293,13 @@ private:
 
     // --- MidiInputCallback ---
     void handleIncomingMidiMessage(juce::MidiInput*, const juce::MidiMessage&) override;
+
+    // --- State serialisation ---
+    // getStateInformation forwards here with includeScenes = true.
+    // storeScene uses includeScenes = false so scene snapshots don't nest
+    // the other scenes' blobs inside themselves (which made the saved
+    // state grow geometrically with every store).
+    void writeState(juce::MemoryBlock& dest, bool includeScenes);
 
     // --- Core helpers ---
     void advanceStep();

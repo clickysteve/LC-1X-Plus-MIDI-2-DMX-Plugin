@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(DMXLightController VERSION 1.0.0 LANGUAGES C CXX)
+project(DMXLightController VERSION 1.2.0 LANGUAGES C CXX)
 
 # ---------- macOS universal binary (Intel + Apple Silicon) ----------
 if(APPLE)
@@ -67,6 +67,42 @@ target_link_libraries(DMXLightController
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
+
+# ---------- Unit tests (optional, headless) ----------
+# Build with:  cmake -B build -DLC1X_BUILD_TESTS=ON  &&  cmake --build build --target LC1XTests
+# Run:         ./build/LC1XTests_artefacts/LC1XTests   (path varies per generator/config)
+option(LC1X_BUILD_TESTS "Build the LC1X unit test runner" OFF)
+
+if(LC1X_BUILD_TESTS)
+    juce_add_console_app(LC1XTests PRODUCT_NAME "LC1XTests")
+
+    target_sources(LC1XTests
+        PRIVATE
+            Tests/TestMain.cpp
+            Tests/EngineTests.cpp
+            Tests/ProcessorTests.cpp
+    )
+
+    # Link the plugin's shared-code target: pulls in the compiled Source/
+    # files, the JUCE modules, the generated JuceHeader.h include path and
+    # the JucePlugin_* definitions.
+    target_link_libraries(LC1XTests PRIVATE DMXLightController)
+
+    target_include_directories(LC1XTests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source
+            # The generated JuceHeader.h lives in the plugin target's
+            # generated-sources directory and isn't propagated by linking.
+            $<TARGET_PROPERTY:DMXLightController,JUCE_GENERATED_SOURCES_DIRECTORY>
+            # Module headers for JuceHeader.h — the module *code* comes from
+            # the linked shared-code static library, headers resolve here.
+            ${CMAKE_CURRENT_SOURCE_DIR}/JUCE/modules)
+
+    target_compile_features(LC1XTests PRIVATE cxx_std_17)
+
+    enable_testing()
+    add_test(NAME LC1XTests COMMAND LC1XTests)
+endif()
 
 # ---------- macOS code signing (optional) ----------
 # Leave empty for unsigned local dev builds. Set to a full Developer ID
