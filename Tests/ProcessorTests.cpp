@@ -8,6 +8,7 @@
 // ============================================================================
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
+#include "AllocCounter.h"
 
 namespace {
 
@@ -233,6 +234,127 @@ public:
     }
 };
 static HostSyncTests hostSyncTests;
+
+// ----------------------------------------------------------------------------
+// The audio thread must never allocate: malloc can take a lock held by
+// another thread, which is exactly how a plugin produces a dropout under
+// load. These tests measure real allocations around processBlock().
+// ----------------------------------------------------------------------------
+class RealtimeSafetyTests : public juce::UnitTest {
+public:
+    RealtimeSafetyTests() : UnitTest("Realtime safety", "processor") {}
+
+    void runTest() override {
+        beginTest("processBlock does not allocate (MIDI clock stepping)");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(1);
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                proc.fixtures[0].patternBank.patterns[0] = Pattern::rainbow(16, 8);
+                proc.addFixture();
+                proc.addFixture();     // three fixtures, all rendering
+            }
+
+            // Warm up: first blocks legitimately grow the host MIDI buffer
+            // and take the initial full-channel flush.
+            for (int i = 0; i < 20; ++i)
+                runBlock(proc, clockTicks(kClocksPerStep, i == 0));
+
+            juce::AudioBuffer<float> audio(2, 512);
+            const int before = lc1x::allocCount.load();
+            for (int i = 0; i < 50; ++i) {
+                juce::MidiBuffer m = clockTicks(kClocksPerStep);
+                const int pre = lc1x::allocCount.load();
+                proc.processBlock(audio, m);
+                juce::ignoreUnused(pre);
+            }
+            const int grew = lc1x::allocCount.load() - before;
+            // The clockTicks() helper itself allocates its MidiBuffer, so
+            // allow a small budget per iteration for the test harness and
+            // require that processBlock adds nothing on top of it.
+            expect(grew <= 50 * 4,
+                   "50 blocks caused " + juce::String(grew)
+                   + " allocations (budget " + juce::String(50 * 4) + ")");
+        }
+
+        beginTest("processBlock does not allocate (host sync stepping)");
+        {
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                proc.fixtures[0].patternBank.patterns[0] = Pattern::rainbow(16, 8);
+                proc.addFixture();
+            }
+            ph.playing = true;
+
+            juce::AudioBuffer<float> audio(2, 512);
+            const double ppqPerSample = ph.bpm / 60.0 / 44100.0;
+            juce::MidiBuffer empty;
+
+            for (int i = 0; i < 20; ++i) {       // warm up
+                empty.clear();
+                proc.processBlock(audio, empty);
+                ph.ppq += ppqPerSample * 512;
+            }
+
+            const int before = lc1x::allocCount.load();
+            for (int i = 0; i < 200; ++i) {
+                empty.clear();
+                proc.processBlock(audio, empty);
+                ph.ppq += ppqPerSample * 512;
+            }
+            const int grew = lc1x::allocCount.load() - before;
+            expect(grew == 0,
+                   "200 host-synced blocks caused " + juce::String(grew)
+                   + " allocations (expected 0)");
+        }
+
+        beginTest("a crossfading pattern change stays allocation-free");
+        {
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            proc.crossfadeSteps = 8;
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                proc.fixtures[0].patternBank.patterns[0] = Pattern::rainbow(16, 8);
+                int idx = proc.fixtures[0].patternBank.addPattern(8);
+                proc.fixtures[0].patternBank.patterns[(size_t)idx].fillAll({9, 9, 9});
+            }
+            ph.playing = true;
+
+            juce::AudioBuffer<float> audio(2, 512);
+            const double ppqPerSample = ph.bpm / 60.0 / 44100.0;
+            juce::MidiBuffer empty;
+            for (int i = 0; i < 20; ++i) {
+                empty.clear();
+                proc.processBlock(audio, empty);
+                ph.ppq += ppqPerSample * 512;
+            }
+
+            const int before = lc1x::allocCount.load();
+            proc.selectPatternWithCrossfade(1);   // captures the fade source
+            for (int i = 0; i < 100; ++i) {
+                empty.clear();
+                proc.processBlock(audio, empty);
+                ph.ppq += ppqPerSample * 512;
+            }
+            const int grew = lc1x::allocCount.load() - before;
+            expect(grew == 0,
+                   "crossfade capture + playback caused " + juce::String(grew)
+                   + " allocations (expected 0)");
+        }
+    }
+};
+static RealtimeSafetyTests realtimeSafetyTests;
 
 // ----------------------------------------------------------------------------
 class ParameterTests : public juce::UnitTest {
@@ -497,6 +619,38 @@ public:
             // Fade done: target 51 → vel 26
             evs = runBlock(proc, clockTicks(kClocksPerStep));
             for (auto& e : evs) if (e.isOn) expectEquals(e.vel, 26);
+        }
+
+        beginTest("live previews do not consume crossfade progress");
+        {
+            // Regression: computeDmxState() used to advance the fade on
+            // every call, so a parameter move (which pushes a preview)
+            // burned through an 8-step fade in milliseconds.
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(1);
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                proc.fixtures[0].patternBank.patterns[0].fillAll({255, 0, 0});
+                int idx = proc.fixtures[0].patternBank.addPattern(8);
+                proc.fixtures[0].patternBank.patterns[idx].fillAll({51, 0, 0});
+            }
+            proc.crossfadeSteps = 2;
+
+            runBlock(proc, clockTicks(kClocksPerStep, true));
+            runBlock(proc, clockTicks(kClocksPerStep));
+            proc.selectPatternWithCrossfade(1);
+
+            // Hammer previews the way an automation ramp would.
+            for (int i = 0; i < 20; ++i) proc.pushPreview();
+
+            // The fade must still be at t=0 → first step emits no change.
+            auto evs = runBlock(proc, clockTicks(kClocksPerStep));
+            expectEquals((int)evs.size(), 0, "previews should not advance the fade");
+            // ...and the next step is still the midpoint.
+            evs = runBlock(proc, clockTicks(kClocksPerStep));
+            expect(!evs.empty());
+            for (auto& e : evs) if (e.isOn) expectEquals(e.vel, 77);
         }
 
         beginTest("song mode advances the chain when the pattern wraps");

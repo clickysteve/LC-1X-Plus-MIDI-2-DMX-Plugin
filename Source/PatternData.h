@@ -92,6 +92,24 @@ public:
         return std::vector<RGBColor>(numSegments);
     }
 
+    /// Allocation-free variant of getStepColors() for the realtime path.
+    /// Copies at most maxCount segments into dest and returns how many were
+    /// written. Out-of-range steps yield black rather than failing, matching
+    /// getStepColors(). Never allocates — safe to call from the audio thread.
+    int getStepColorsInto(int step, RGBColor* dest, int maxCount) const {
+        const int n = std::min(numSegments, maxCount);
+        if (n <= 0) return 0;
+        if (step >= 0 && step < numSteps) {
+            const auto& row = grid_[(size_t)step];
+            const int m = std::min(n, (int)row.size());
+            for (int i = 0; i < m; ++i) dest[i] = row[(size_t)i];
+            for (int i = m; i < n; ++i) dest[i] = RGBColor{};
+        } else {
+            for (int i = 0; i < n; ++i) dest[i] = RGBColor{};
+        }
+        return n;
+    }
+
     // --- Resize ---
     void setSteps(int n) {
         n = std::clamp(n, 1, 64);

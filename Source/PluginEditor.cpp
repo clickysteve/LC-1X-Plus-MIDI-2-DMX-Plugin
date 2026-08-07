@@ -50,7 +50,16 @@ static uint32_t packFloodColor(RGBColor c) {
 //  GridComponent
 // ############################################################################
 
+// NOTE ON LOCKING IN THIS FILE
+// Every method that dereferences a Pattern takes proc.dataLock. A
+// MIDI-learned "Generate" mapping does `*pat = Pattern::chase(...)` on the
+// audio/MIDI thread, which frees and rebuilds the pattern's grid — reading
+// it unlocked from paint() or a mouse handler is a use-after-free. The
+// lock is recursive, so nesting these calls is safe, and the consumer side
+// only ever holds it for a few microseconds.
+
 void GridComponent::recalcSize() {
+    const juce::ScopedLock sl(proc.dataLock);
     auto* pat = proc.currentBank().current();
     if (!pat) return;
 
@@ -77,6 +86,7 @@ void GridComponent::recalcSize() {
 }
 
 void GridComponent::paint(Graphics& g) {
+    const juce::ScopedLock sl(proc.dataLock);
     auto* pat = proc.currentBank().current();
     if (!pat) { g.fillAll(Theme::GRID_BG); return; }
 
@@ -199,6 +209,7 @@ void GridComponent::paint(Graphics& g) {
 }
 
 std::pair<int,int> GridComponent::cellAt(Point<float> pos) const {
+    const juce::ScopedLock sl(proc.dataLock);
     auto* pat = proc.currentBank().current();
     if (!pat) return {-1, -1};
     int step = (int)((pos.x - Theme::LABEL_W) / cellW);
@@ -209,6 +220,7 @@ std::pair<int,int> GridComponent::cellAt(Point<float> pos) const {
 }
 
 void GridComponent::applyColor(int step, int seg) {
+    const juce::ScopedLock sl(proc.dataLock);
     auto* pat = proc.currentBank().current();
     if (!pat) return;
     if (eraseMode) {
@@ -232,6 +244,7 @@ void GridComponent::applyColor(int step, int seg) {
 }
 
 void GridComponent::mouseDown(const MouseEvent& e) {
+    const juce::ScopedLock sl(proc.dataLock);
     auto* pat = proc.currentBank().current();
     if (!pat) return;
 
@@ -288,6 +301,7 @@ void GridComponent::mouseDrag(const MouseEvent& e) {
 }
 
 void GridComponent::mouseWheelMove(const MouseEvent& e, const MouseWheelDetails& w) {
+    const juce::ScopedLock sl(proc.dataLock);
     auto [step, seg] = cellAt(e.position);
     if (step < 0) return;
     auto* pat = proc.currentBank().current();
@@ -365,6 +379,7 @@ void BarPreviewComponent::paint(Graphics& g) {
     g.setColour(Theme::BORDER);
     g.drawRect(getLocalBounds(), 1);
 
+    const juce::ScopedLock sl(proc.dataLock);
     auto* pat = proc.currentBank().current();
     if (!pat) return;
 
@@ -424,6 +439,7 @@ static constexpr int kBlockW = 100;
 static constexpr int kBlockH = 50;
 
 int SongTimelineComponent::blockAt(float x) const {
+    const juce::ScopedLock sl(proc.dataLock);
     int idx = (int)(x / kBlockW);
     if (idx >= 0 && idx < (int)proc.song.blocks.size())
         return idx;
@@ -433,6 +449,7 @@ int SongTimelineComponent::blockAt(float x) const {
 void SongTimelineComponent::paint(Graphics& g) {
     g.fillAll(Theme::BG_SECONDARY);
 
+    const juce::ScopedLock sl(proc.dataLock);
     auto& song = proc.song;
     // Content size is driven by the editor (see updateSongTimelineSize).
     // We deliberately do NOT call setSize from paint - calling it here
@@ -759,24 +776,36 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     segsSlider.setSliderStyle(Slider::IncDecButtons);
     segsSlider.setTextBoxStyle(Slider::TextBoxLeft, false, 32, 22);
     segsSlider.onValueChange = [this] {
-        int n = (int)segsSlider.getValue();
+        const int n = (int)segsSlider.getValue();
+
+        // Build the resized patterns OUTSIDE the lock, then swap them in.
+        // The audio thread blocks on dataLock in processBlock, so holding
+        // it across a full bank rebuild (allocating a new grid per pattern)
+        // is a priority inversion that can cost an audio dropout. Doing the
+        // work up front reduces the locked section to a few vector swaps.
+        std::vector<Pattern> rebuilt;
         {
-            // Take the data lock before touching any pattern — the
-            // HighResolutionTimer and audio thread read these fields
-            // concurrently and reassigning a Pattern (destroying/rebuilding
-            // its grid_ vector) while a reader is mid-access crashes.
             const juce::ScopedLock l(proc.dataLock);
             auto& fix = proc.fixtures[proc.activeFixture];
             if (n == fix.numSegments) return;
-            fix.numSegments = n;
-            // Resize all patterns in this fixture's bank
-            for (auto& pat : fix.patternBank.patterns) {
-                // Rebuild grid preserving existing contents
-                auto copy = pat;
-                pat = Pattern(copy.name, copy.numSteps, n, copy.subdiv);
-                for (int s = 0; s < copy.numSteps; s++)
-                    for (int seg = 0; seg < std::min(n, copy.numSegments); seg++)
-                        pat.setColor(s, seg, copy.getColor(s, seg));
+            rebuilt.reserve(fix.patternBank.patterns.size());
+            for (auto& pat : fix.patternBank.patterns)
+                rebuilt.push_back(pat);          // cheap copies, still locked
+        }
+        for (auto& pat : rebuilt) {
+            Pattern resized(pat.name, pat.numSteps, n, pat.subdiv);
+            for (int s = 0; s < pat.numSteps; s++)
+                for (int seg = 0; seg < std::min(n, pat.numSegments); seg++)
+                    resized.setColor(s, seg, pat.getColor(s, seg));
+            pat = std::move(resized);
+        }
+        {
+            const juce::ScopedLock l(proc.dataLock);
+            auto& fix = proc.fixtures[proc.activeFixture];
+            if (rebuilt.size() == fix.patternBank.patterns.size()) {
+                fix.numSegments = n;
+                for (size_t i = 0; i < rebuilt.size(); ++i)
+                    fix.patternBank.patterns[i] = std::move(rebuilt[i]);
             }
         }
         refreshAll();
@@ -1595,9 +1624,30 @@ bool DMXControllerEditor::keyPressed(const KeyPress& key) {
 // Timer (30 fps UI refresh)
 // ============================================================================
 void DMXControllerEditor::timerCallback() {
-    grid.repaint();
-    barPreview.repaint();
-    songTimeline.repaint();
+    // Only repaint the drawing-heavy components when something they render
+    // has actually changed (see VisualState). Edits repaint directly at the
+    // point of edit, so nothing is missed — this just stops the plugin
+    // burning CPU redrawing an identical frame 30 times a second.
+    {
+        VisualState now;
+        now.step      = proc.currentStep.load();
+        now.hue       = proc.hueShiftDeg.load();
+        now.master    = proc.masterDimmer.load();
+        now.blackout  = proc.blackoutActive.load();
+        now.flood     = proc.floodActive.load();
+        now.floodCol  = proc.floodColor.load();
+        now.fixture   = proc.activeFixture.load();
+        now.patternId = proc.currentBank().currentIndex;
+        now.songBlock = proc.songModeActive ? proc.songPlayer.currentBlock : -1;
+
+        if (now != lastVisual_) {
+            const bool songChanged = (now.songBlock != lastVisual_.songBlock);
+            lastVisual_ = now;
+            grid.repaint();
+            barPreview.repaint();
+            if (songChanged) songTimeline.repaint();
+        }
+    }
 
     bool playing = proc.isPlaying.load();
     playBtn.setButtonText(playing ? "PAUSE" : "PLAY");

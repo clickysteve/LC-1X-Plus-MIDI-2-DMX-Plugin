@@ -112,6 +112,48 @@ struct FixtureConfig {
         return autoSpan;
     }
 
+    /// Allocation-free channel mapping for the realtime path.
+    ///
+    /// Writes (relative DMX offset, value) pairs into `out`, up to `maxOut`
+    /// entries, and returns the number written. Identical channel logic to
+    /// mapColorsToDmx() below — that one is kept as a convenience wrapper
+    /// for UI/export code and tests. Never allocates, so it is safe to call
+    /// from the audio thread.
+    int mapColorsToDmxInto(const RGBColor* colors, int numColors,
+                           std::pair<int,int>* out, int maxOut) const {
+        const auto& prof = profile();
+        int n = 0;
+
+        for (int seg = 0; seg < numColors; seg++) {
+            const auto c = colors[seg];
+            const int base = seg * prof.channelsPerSegment;
+
+            const int dimValue = prof.dimAlwaysMax
+                                   ? 255
+                                   : std::max({c.r, c.g, c.b});
+
+            for (int ch = 0; ch < (int)prof.channelLayout.size(); ch++) {
+                if (n >= maxOut) return n;
+                const int offset = base + ch;
+                switch (prof.channelLayout[(size_t)ch]) {
+                    case 'r': out[n++] = {offset, c.r}; break;
+                    case 'g': out[n++] = {offset, c.g}; break;
+                    case 'b': out[n++] = {offset, c.b}; break;
+                    case 'w': out[n++] = {offset, std::min({c.r, c.g, c.b})}; break;
+                    case 'd': out[n++] = {offset, dimValue}; break;
+                    default: break;
+                }
+            }
+        }
+
+        // Extra channels (strobe / mode / speed) — see note in the wrapper.
+        for (auto& [off, val] : prof.extraChannels) {
+            if (n >= maxOut) return n;
+            out[n++] = {off, val};
+        }
+        return n;
+    }
+
     /// Map a vector of segment RGB colours → list of (relative DMX offset, value) pairs
     std::vector<std::pair<int,int>> mapColorsToDmx(const std::vector<RGBColor>& colors) const {
         std::vector<std::pair<int,int>> result;

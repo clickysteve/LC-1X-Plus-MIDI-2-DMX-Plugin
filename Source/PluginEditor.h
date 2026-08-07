@@ -186,6 +186,32 @@ private:
     // scene was loaded via a MIDI mapping and the controls need a refresh.
     int lastSceneLoadCount_ = 0;
 
+    // ---- Repaint gating -------------------------------------------------
+    // The 30 Hz timer used to repaint the grid, bar preview and song
+    // timeline unconditionally. On a big pattern that is ~1000 filled
+    // rectangles plus text per frame, burned continuously even when the
+    // plugin is sitting idle. Now the timer only repaints when something
+    // it draws has actually changed; direct edits still repaint at the
+    // point of edit, as before.
+    struct VisualState {
+        int      step      = -1;
+        float    hue       = 0.0f;
+        float    master    = 1.0f;
+        bool     blackout  = false;
+        bool     flood     = false;
+        uint32_t floodCol  = 0;
+        int      patternId = -1;
+        int      fixture   = -1;
+        int      songBlock = -1;
+        bool operator!=(const VisualState& o) const {
+            return step != o.step || hue != o.hue || master != o.master
+                || blackout != o.blackout || flood != o.flood
+                || floodCol != o.floodCol || patternId != o.patternId
+                || fixture != o.fixture || songBlock != o.songBlock;
+        }
+    };
+    VisualState lastVisual_;
+
     // ---- Parameter attachments (host automation ↔ UI) ----
     using SliderAtt = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ButtonAtt = juce::AudioProcessorValueTreeState::ButtonAttachment;

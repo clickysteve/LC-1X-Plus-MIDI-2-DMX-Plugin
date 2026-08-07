@@ -6,6 +6,28 @@
 // it must never require a display, audio device, or MIDI hardware.
 // ============================================================================
 #include <JuceHeader.h>
+#include "AllocCounter.h"
+#include <cstdlib>
+
+// ----------------------------------------------------------------------------
+// Global allocation counter, used by the realtime-safety tests to prove that
+// processBlock() never hits the allocator. Replacing global operator new is
+// the only portable way to observe this; the counter is only *read* inside
+// an explicitly scoped measurement, so the cost elsewhere is one relaxed
+// atomic increment per allocation.
+// ----------------------------------------------------------------------------
+namespace lc1x { std::atomic<int> allocCount { 0 }; }
+
+void* operator new(std::size_t n) {
+    lc1x::allocCount.fetch_add(1, std::memory_order_relaxed);
+    if (void* p = std::malloc(n == 0 ? 1 : n)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t n) { return ::operator new(n); }
+void  operator delete(void* p) noexcept       { std::free(p); }
+void  operator delete[](void* p) noexcept     { std::free(p); }
+void  operator delete(void* p, std::size_t) noexcept   { std::free(p); }
+void  operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 int main()
 {

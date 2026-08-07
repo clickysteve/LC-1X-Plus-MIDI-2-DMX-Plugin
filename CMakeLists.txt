@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(DMXLightController VERSION 1.2.0 LANGUAGES C CXX)
+project(DMXLightController VERSION 1.2.1 LANGUAGES C CXX)
 
 # ---------- macOS universal binary (Intel + Apple Silicon) ----------
 if(APPLE)
@@ -82,6 +82,11 @@ if(LC1X_BUILD_TESTS)
             Tests/EngineTests.cpp
             Tests/ProcessorTests.cpp
     )
+
+    # The realtime-safety tests replace global operator new to count
+    # allocations, so the runner must not be built with an allocator that
+    # bypasses it.
+    target_include_directories(LC1XTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Tests)
 
     # Link the plugin's shared-code target: pulls in the compiled Source/
     # files, the JUCE modules, the generated JuceHeader.h include path and

@@ -246,7 +246,19 @@ private:
     // --- APVTS plumbing ---
     void parameterChanged(const juce::String& parameterID, float newValue) override;
     void syncAtomicsFromParams();
+
+    // Live previews driven by parameter moves are coalesced to ~40 Hz.
+    // Without this, a smooth automation ramp fires one preview per audio
+    // block (~86/s at 512 samples) and each one re-sends every changed
+    // channel — enough to saturate a 31250-baud MIDI link.
     std::atomic<bool> previewDirty_ {false};
+    bool   previewRetryPending_ = false;
+    double lastPreviewMs_       = 0.0;
+    static constexpr double kPreviewIntervalMs = 25.0;
+    void   servicePreview();
+    // Lets a delayed callback know the processor is still alive.
+    std::shared_ptr<std::atomic<bool>> aliveFlag_
+        { std::make_shared<std::atomic<bool>>(true) };
     juce::AudioParameterFloat*  pMasterDim_   = nullptr;
     juce::AudioParameterFloat*  pHue_         = nullptr;
     juce::AudioParameterFloat*  pSwing_       = nullptr;
@@ -269,19 +281,67 @@ private:
     // host's MIDI FX chain receives the DMX note stream too.
     juce::MidiBuffer* hostMidiOut_  = nullptr;
     int               hostSamplePos_ = 0;
+    // Reused across blocks (pre-sized in prepareToPlay) so building the
+    // outgoing DMX stream doesn't allocate on the audio thread.
+    juce::MidiBuffer  generatedMidi_;
 
     // --- DMX delta tracking ---
     int dmxState_    [128];
     int prevDmxState_[128];
 
     // --- Crossfade ---
-    std::vector<RGBColor> crossfadeFrom_;
-    int crossfadeProgress_ = 0;
+    // Fixed-size (not std::vector) so capturing the outgoing colours on a
+    // pattern change never allocates — song mode and the Pattern parameter
+    // both trigger this from the audio thread.
+    static constexpr int kMaxSegments     = 64;
+    static constexpr int kMaxChannelPairs = 512;
+    RGBColor crossfadeFrom_[kMaxSegments] {};
+    int      crossfadeFromCount_ = 0;
+    int      crossfadeProgress_  = 0;
+
+    // Scratch buffers for computeDmxState(). Only touched under dataLock,
+    // so a single shared copy is safe and keeps the audio thread's stack
+    // (and the allocator) out of the picture entirely.
+    RGBColor           colorBuf_[kMaxSegments] {};
+    std::pair<int,int> pairBuf_[kMaxChannelPairs] {};
 
     // --- Direct MIDI I/O ---
     juce::CriticalSection             midiOutLock_;
     std::unique_ptr<juce::MidiOutput> directMidiOut_;
     juce::String                      currentMidiOutName_;
+
+    // ---- Realtime-safe DMX output path ----------------------------------
+    // emitDmxDelta() can run on the audio thread (host sync / MIDI clock),
+    // where a CoreMIDI sendMessageNow() syscall — or blocking on
+    // midiOutLock_ while the message thread is inside openDevice() — is a
+    // dropout waiting to happen. Instead the realtime side pushes packed
+    // 3-byte messages into a lock-free FIFO and a dedicated sender thread
+    // performs the actual device writes. DMX refreshes at ~44 Hz, so the
+    // sub-millisecond handoff latency is inaudible (and invisible).
+    class MidiOutSender : private juce::Thread {
+    public:
+        explicit MidiOutSender(DMXControllerProcessor& o);
+        ~MidiOutSender() override;
+
+        /// Realtime-safe: never allocates, never blocks. Returns false if
+        /// the queue is full (caller then forces a full resend).
+        bool push(juce::uint8 status, juce::uint8 d1, juce::uint8 d2) noexcept;
+
+    private:
+        void run() override;
+
+        static constexpr int kCapacity = 8192;
+        DMXControllerProcessor& owner_;
+        juce::AbstractFifo      fifo_ { kCapacity };
+        std::array<juce::uint32, (size_t)kCapacity> slots_ {};
+        juce::WaitableEvent     wake_;
+    };
+    std::unique_ptr<MidiOutSender> midiSender_;
+    void sendPackedToDevice(juce::uint32 packed);   // sender thread only
+
+    // Set when the FIFO overflowed: the next emit re-sends every channel so
+    // the hardware can't be left holding a stale value.
+    std::atomic<bool> outputDesynced_ {false};
 
     juce::CriticalSection             midiInLock_;
     std::unique_ptr<juce::MidiInput>  directMidiIn_;
@@ -303,11 +363,15 @@ private:
 
     // --- Core helpers ---
     void advanceStep();
-    void computeDmxState();
+    // advanceFades: only a real step advance moves a crossfade along. Live
+    // previews (parameter moves, UI edits) recompute the same frame and
+    // must NOT consume fade progress, or a fader wiggle would blow through
+    // an 8-step fade in a few milliseconds.
+    void computeDmxState(bool advanceFades = false);
     void emitDmxDelta(juce::MidiBuffer* buf, int sampleOffset);
     void parseIncomingMidi(const juce::MidiMessage& msg);
     static int dmxToVelocity(int dmx);
-    std::vector<RGBColor> applyCrossfade(const std::vector<RGBColor>& colors);
+    void applyCrossfadeInPlace(RGBColor* colors, int n, bool advance);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DMXControllerProcessor)
 };

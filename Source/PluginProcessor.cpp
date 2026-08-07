@@ -43,6 +43,67 @@ DMXControllerProcessor::createParameterLayout() {
 }
 
 // ============================================================================
+// MIDI output sender thread — drains the realtime FIFO to the device
+// ============================================================================
+DMXControllerProcessor::MidiOutSender::MidiOutSender(DMXControllerProcessor& o)
+    : Thread("LC1X DMX Out"), owner_(o)
+{
+    // Above normal but below the audio thread: DMX wants low latency, but
+    // never at the audio callback's expense.
+    startThread(Priority::high);
+}
+
+DMXControllerProcessor::MidiOutSender::~MidiOutSender() {
+    signalThreadShouldExit();
+    wake_.signal();
+    stopThread(1000);
+}
+
+bool DMXControllerProcessor::MidiOutSender::push(juce::uint8 status,
+                                                 juce::uint8 d1,
+                                                 juce::uint8 d2) noexcept {
+    const juce::uint32 packed = ((juce::uint32)status << 16)
+                              | ((juce::uint32)d1     <<  8)
+                              |  (juce::uint32)d2;
+
+    int start1, size1, start2, size2;
+    fifo_.prepareToWrite(1, start1, size1, start2, size2);
+    if (size1 + size2 < 1)
+        return false;                       // full — caller forces a resend
+    slots_[(size_t)(size1 > 0 ? start1 : start2)] = packed;
+    fifo_.finishedWrite(1);
+    wake_.signal();
+    return true;
+}
+
+void DMXControllerProcessor::MidiOutSender::run() {
+    while (!threadShouldExit()) {
+        int start1, size1, start2, size2;
+        fifo_.prepareToRead(fifo_.getNumReady(), start1, size1, start2, size2);
+
+        if (size1 + size2 > 0) {
+            for (int i = 0; i < size1; ++i)
+                owner_.sendPackedToDevice(slots_[(size_t)(start1 + i)]);
+            for (int i = 0; i < size2; ++i)
+                owner_.sendPackedToDevice(slots_[(size_t)(start2 + i)]);
+            fifo_.finishedRead(size1 + size2);
+        } else {
+            wake_.wait(100);
+        }
+    }
+}
+
+void DMXControllerProcessor::sendPackedToDevice(juce::uint32 packed) {
+    const juce::uint8 status = (juce::uint8)((packed >> 16) & 0xFF);
+    const juce::uint8 d1     = (juce::uint8)((packed >>  8) & 0xFF);
+    const juce::uint8 d2     = (juce::uint8)( packed        & 0xFF);
+
+    const juce::ScopedLock l(midiOutLock_);
+    if (directMidiOut_)
+        directMidiOut_->sendMessageNow(juce::MidiMessage(status, d1, d2));
+}
+
+// ============================================================================
 // Construction
 // ============================================================================
 DMXControllerProcessor::DMXControllerProcessor()
@@ -72,9 +133,14 @@ DMXControllerProcessor::DMXControllerProcessor()
     for (auto* id : {"masterDim", "hueShift", "swing", "blackout",
                      "floodActive", "floodColor", "pattern"})
         apvts.addParameterListener(id, this);
+
+    midiSender_ = std::make_unique<MidiOutSender>(*this);
 }
 
 DMXControllerProcessor::~DMXControllerProcessor() {
+    // Tell any in-flight delayed preview callback that we're gone.
+    aliveFlag_->store(false);
+
     for (auto* id : {"masterDim", "hueShift", "swing", "blackout",
                      "floodActive", "floodColor", "pattern"})
         apvts.removeParameterListener(id, this);
@@ -85,6 +151,8 @@ DMXControllerProcessor::~DMXControllerProcessor() {
         if (directMidiIn_) directMidiIn_->stop();
         directMidiIn_.reset();
     }
+    // Stop the sender before closing the device it writes to.
+    midiSender_.reset();
     {
         const juce::ScopedLock l(midiOutLock_);
         directMidiOut_.reset();
@@ -195,6 +263,10 @@ void DMXControllerProcessor::renumberDefaultFixtures() {
 void DMXControllerProcessor::prepareToPlay(double sr, int) {
     sampleRate_    = sr;
     sampleCounter_ = 0.0;
+    // Worst case is 128 channel updates per step × a few steps per block;
+    // reserving up front keeps processBlock allocation-free.
+    generatedMidi_.ensureSize(4096);
+    generatedMidi_.clear();
 }
 
 void DMXControllerProcessor::releaseResources() {}
@@ -228,7 +300,10 @@ void DMXControllerProcessor::setMidiOutputDevice(const juce::String& name) {
             directMidiOut_ = juce::MidiOutput::openDevice(d.identifier);
             if (directMidiOut_) {
                 currentMidiOutName_ = name;
-                std::memset(prevDmxState_, -1, sizeof(prevDmxState_));
+                // Force a full resend to the new device. Flagging it (rather
+                // than clearing prevDmxState_ here) keeps that array owned
+                // solely by the dataLock side — this runs under midiOutLock_.
+                outputDesynced_.store(true);
             }
             return;
         }
@@ -308,12 +383,13 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     // DMX note deltas generated during this block (MIDI-clock-driven step
     // advances, transport resets) are collected here and handed back to
     // the host, so the plugin's declared MIDI output actually carries the
-    // DMX stream — not just the direct device connection.
-    juce::MidiBuffer generated;
+    // DMX stream — not just the direct device connection. The buffer is a
+    // pre-sized member, so this doesn't allocate.
+    generatedMidi_.clear();
 
     {
         const juce::ScopedLock l(dataLock);
-        hostMidiOut_   = &generated;
+        hostMidiOut_   = &generatedMidi_;
         hostSamplePos_ = 0;
 
         // Parse incoming MIDI from the host (always)
@@ -363,7 +439,14 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                         hostStepValid_ = true;
                     }
 
-                    for (juce::int64 n = lastHostStep_ + 1; stepStartPpq(n) < blockEnd; ++n) {
+                    // Safety bound: a pathological tempo/subdiv combination
+                    // must never spin the audio thread. Anything beyond
+                    // this is inaudible strobing anyway.
+                    constexpr int kMaxStepsPerBlock = 64;
+                    int emitted = 0;
+                    for (juce::int64 n = lastHostStep_ + 1;
+                         stepStartPpq(n) < blockEnd && emitted < kMaxStepsPerBlock;
+                         ++n, ++emitted) {
                         const double off = (stepStartPpq(n) - ppq) / ppqPerSample;
                         hostSamplePos_ = juce::jlimit(0, juce::jmax(0, buffer.getNumSamples() - 1),
                                                       (int)std::llround(off));
@@ -403,7 +486,10 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         hostMidiOut_ = nullptr;
     }
 
-    midi.swapWith(generated);
+    // Replace the host's incoming events (already consumed above) with the
+    // DMX stream. Copying rather than swapping keeps our reserved capacity.
+    midi.clear();
+    midi.addEvents(generatedMidi_, 0, -1, 0);
 }
 
 // ============================================================================
@@ -420,7 +506,7 @@ void DMXControllerProcessor::parseIncomingMidi(const juce::MidiMessage& msg) {
             int clocksPerStep = std::max(1, (int)std::round(24.0 / pat->subdiv));
             if (clockCount % clocksPerStep == 0) {
                 advanceStep();
-                computeDmxState();
+                computeDmxState(true);   // real step advance: fades progress
                 emitDmxDelta(nullptr, 0);
             }
         }
@@ -605,10 +691,39 @@ void DMXControllerProcessor::handleAsyncUpdate() {
     if (idx >= 0 && loadScene(idx))
         sceneLoadBroadcast++;   // editor timer notices and refreshes
 
-    // Parameter moves (automation, attachments, MIDI-learn) request a live
-    // preview so the hardware follows even while transport is stopped.
-    if (previewDirty_.exchange(false))
+    servicePreview();
+}
+
+// Coalesce parameter-driven previews to kPreviewIntervalMs (~40 Hz). A
+// smooth automation ramp otherwise fires one preview per audio block and
+// re-sends every changed channel, which is far more than a 31250-baud MIDI
+// link can carry. The trailing edge still lands: if we skip a preview
+// because it's too soon, a delayed callback runs the final one.
+void DMXControllerProcessor::servicePreview() {
+    if (!previewDirty_.load()) return;
+
+    const double now   = juce::Time::getMillisecondCounterHiRes();
+    const double since = now - lastPreviewMs_;
+
+    if (since >= kPreviewIntervalMs) {
+        previewDirty_.store(false);
+        lastPreviewMs_ = now;
         pushPreview();
+        return;
+    }
+
+    if (previewRetryPending_) return;     // one trailing call is enough
+    previewRetryPending_ = true;
+
+    std::weak_ptr<std::atomic<bool>> alive = aliveFlag_;
+    juce::Timer::callAfterDelay((int)std::ceil(kPreviewIntervalMs - since),
+        [this, alive] {
+            // The processor may have been destroyed while this was pending.
+            auto live = alive.lock();
+            if (!live || !live->load()) return;
+            previewRetryPending_ = false;
+            servicePreview();
+        });
 }
 
 // ============================================================================
@@ -620,7 +735,7 @@ void DMXControllerProcessor::hiResTimerCallback() {
     {
         const juce::ScopedLock l(dataLock);
         advanceStep();
-        computeDmxState();
+        computeDmxState(true);   // real step advance: fades progress
         emitDmxDelta(nullptr, 0);
         // Must stay inside the lock: updateClockTimer dereferences the
         // current pattern, which the UI can reassign / resize.
@@ -694,7 +809,7 @@ void DMXControllerProcessor::applyHostStep(juce::int64 globalStep) {
         }
     }
 
-    computeDmxState();
+    computeDmxState(true);   // real step advance: fades progress
     emitDmxDelta(nullptr, 0);
 }
 
@@ -707,13 +822,15 @@ void DMXControllerProcessor::selectPatternWithCrossfade(int idx) {
     if (idx < 0 || idx >= (int)bank.patterns.size() || idx == bank.currentIndex)
         return;
 
-    // Capture the outgoing pattern's colours at the current step so
-    // applyCrossfade() can blend from them into the new pattern.
+    // Capture the outgoing pattern's colours at the current step so the
+    // crossfade can blend from them into the new pattern. Allocation-free:
+    // song mode and the Pattern parameter reach here on the audio thread.
     if (crossfadeSteps.load() > 0) {
         if (auto* oldPat = bank.current()) {
             const int steps = std::max(1, oldPat->numSteps);
-            crossfadeFrom_     = oldPat->getStepColors(currentStep.load() % steps);
-            crossfadeProgress_ = 0;
+            crossfadeFromCount_ = oldPat->getStepColorsInto(
+                currentStep.load() % steps, crossfadeFrom_, kMaxSegments);
+            crossfadeProgress_  = 0;
         }
     }
     bank.select(idx);
@@ -742,7 +859,7 @@ static RGBColor applyHueSat(RGBColor c, float hueDeg, float satMul) {
     return RGBColor::hsvToRgb(h, s, v);
 }
 
-void DMXControllerProcessor::computeDmxState() {
+void DMXControllerProcessor::computeDmxState(bool advanceFades) {
     std::memset(dmxState_, 0, sizeof(dmxState_));
 
     if (blackoutActive.load()) return;      // hard kill, but transport keeps running
@@ -770,16 +887,22 @@ void DMXControllerProcessor::computeDmxState() {
 
     const int activeFix = activeFixture.load();
 
+    // NOTE: this function runs on the audio thread in Host Sync mode and on
+    // the MIDI-clock / timer threads otherwise. It must not allocate — hence
+    // the fixed scratch buffers and the *Into() accessors below rather than
+    // the vector-returning convenience APIs.
     for (int fi = 0; fi < (int)fixtures.size(); ++fi) {
         auto& fixture = fixtures[fi];
-        std::vector<RGBColor> colors;
+        int n = 0;
+
         if (flood) {
             // FLOOD is an ALL-fixtures override. Every fixture in the rig
             // gets the flood colour, mapped through its OWN channel layout
-            // (mapColorsToDmx honours {d,r,g,b} par cans, RGBW fixtures,
-            // etc.), so mixed rigs flood correctly across differing
-            // channel offsets.
-            colors.assign(std::max(1, fixture.numSegments), floodCol);
+            // (the mapping honours {d,r,g,b} par cans, RGBW fixtures, etc.),
+            // so mixed rigs flood correctly across differing channel
+            // offsets.
+            n = std::clamp(fixture.numSegments, 1, kMaxSegments);
+            for (int i = 0; i < n; ++i) colorBuf_[i] = floodCol;
         } else {
             auto* pat = fixture.patternBank.current();
             if (!pat) continue;      // normal playback still needs a pattern
@@ -787,20 +910,18 @@ void DMXControllerProcessor::computeDmxState() {
             // length — otherwise fixtures with shorter patterns than the
             // active one render out-of-range (black) instead of looping.
             const int fixStep = (pat->numSteps > 0) ? step % pat->numSteps : 0;
-            colors = pat->getStepColors(fixStep);
-            // Crossfade blends the ACTIVE fixture's pattern change; it's
-            // applied to that fixture only so crossfadeProgress_ advances
-            // exactly once per computed frame.
+            n = pat->getStepColorsInto(fixStep, colorBuf_, kMaxSegments);
+            // Crossfade blends the ACTIVE fixture's pattern change.
             if (fi == activeFix)
-                colors = applyCrossfade(colors);
+                applyCrossfadeInPlace(colorBuf_, n, advanceFades);
         }
 
         // Apply hue shift (skipped for flood so the chosen colour stays
         // exact), then master + per-fixture brightness
-        float trim = master * fixture.brightnessOffset;
-        for (auto& c : colors) {
-            if (!flood) c = applyHueSat(c, hue, 1.0f);
-            c = applyTrim(c, trim);
+        const float trim = master * fixture.brightnessOffset;
+        for (int i = 0; i < n; ++i) {
+            if (!flood) colorBuf_[i] = applyHueSat(colorBuf_[i], hue, 1.0f);
+            colorBuf_[i] = applyTrim(colorBuf_[i], trim);
         }
 
         // Always route through the fixture's profile so each fixture flood
@@ -808,11 +929,12 @@ void DMXControllerProcessor::computeDmxState() {
         // fast path here that assumed a {r,g,b} layout — removed so a
         // flood on any layout, including dim-channel par cans, is
         // guaranteed to target the right channels.)
-        auto pairs = fixture.mapColorsToDmx(colors);
-        for (auto& [off, val] : pairs) {
-            int ch = fixture.dmxStart + off;
+        const int numPairs = fixture.mapColorsToDmxInto(colorBuf_, n,
+                                                        pairBuf_, kMaxChannelPairs);
+        for (int i = 0; i < numPairs; ++i) {
+            const int ch = fixture.dmxStart + pairBuf_[i].first;
             if (ch >= 0 && ch < 128)
-                dmxState_[ch] = (uint8_t)std::clamp(val, 0, 255);
+                dmxState_[ch] = (uint8_t)std::clamp(pairBuf_[i].second, 0, 255);
         }
     }
 }
@@ -821,26 +943,41 @@ void DMXControllerProcessor::computeDmxState() {
 // Emit DMX delta
 // ============================================================================
 void DMXControllerProcessor::emitDmxDelta(juce::MidiBuffer* buf, int sampleOffset) {
+    // Realtime-safe: no device I/O, no midiOutLock_, no allocation. Device
+    // writes are handed to MidiOutSender (see its declaration for why).
     constexpr int midiChannel = 1;
 
-    const juce::ScopedLock l(midiOutLock_);
+    // A previous overflow means the hardware may be holding stale values —
+    // forget what we think we sent so this pass re-transmits everything.
+    if (outputDesynced_.exchange(false))
+        std::memset(prevDmxState_, -1, sizeof(prevDmxState_));
 
     for (int ch = 0; ch < 128; ch++) {
-        int vel = dmxToVelocity(dmxState_[ch]);
+        const int vel = dmxToVelocity(dmxState_[ch]);
         if (vel == prevDmxState_[ch])
             continue;
         prevDmxState_[ch] = vel;
 
-        juce::MidiMessage m = (vel > 0)
-            ? juce::MidiMessage::noteOn(midiChannel, ch, (juce::uint8)vel)
-            : juce::MidiMessage::noteOff(midiChannel, ch);
+        const juce::uint8 status = (juce::uint8)((vel > 0 ? 0x90 : 0x80)
+                                                 | (midiChannel - 1));
+        const juce::uint8 d1     = (juce::uint8)ch;
+        const juce::uint8 d2     = (juce::uint8)(vel > 0 ? vel : 0);
 
-        if (buf) buf->addEvent(m, sampleOffset);
-        // While processBlock is running (hostMidiOut_ set under dataLock,
-        // which every caller of emitDmxDelta holds), also feed the host's
-        // MIDI output so DAW-side routing receives the DMX stream.
-        if (hostMidiOut_) hostMidiOut_->addEvent(m, hostSamplePos_);
-        if (directMidiOut_) directMidiOut_->sendMessageNow(m);
+        if (buf || hostMidiOut_) {
+            const juce::MidiMessage m(status, d1, d2);
+            if (buf) buf->addEvent(m, sampleOffset);
+            // While processBlock is running (hostMidiOut_ set under
+            // dataLock, which every caller of emitDmxDelta holds), also
+            // feed the host's MIDI output so DAW-side routing receives the
+            // DMX stream.
+            if (hostMidiOut_) hostMidiOut_->addEvent(m, hostSamplePos_);
+        }
+
+        if (midiSender_ && !midiSender_->push(status, d1, d2)) {
+            // Queue full: stop pushing and force a clean resend next time.
+            outputDesynced_.store(true);
+            break;
+        }
     }
 }
 
@@ -849,26 +986,23 @@ int DMXControllerProcessor::dmxToVelocity(int dmx) {
     return std::min(127, (dmx + 1) / 2);
 }
 
-std::vector<RGBColor> DMXControllerProcessor::applyCrossfade(const std::vector<RGBColor>& colors) {
-    if (crossfadeFrom_.empty() || crossfadeSteps <= 0)
-        return colors;
-    if (crossfadeProgress_ >= crossfadeSteps) {
-        crossfadeFrom_.clear();
-        return colors;
+void DMXControllerProcessor::applyCrossfadeInPlace(RGBColor* colors, int n, bool advance) {
+    const int fadeLen = crossfadeSteps.load();
+    if (crossfadeFromCount_ <= 0 || fadeLen <= 0)
+        return;
+    if (crossfadeProgress_ >= fadeLen) {
+        crossfadeFromCount_ = 0;          // fade finished
+        return;
     }
 
-    float t = (float)crossfadeProgress_ / crossfadeSteps;
-    crossfadeProgress_++;
+    const float t = (float)crossfadeProgress_ / (float)fadeLen;
+    // Only a genuine step advance consumes fade progress — see the note on
+    // computeDmxState(). Previews re-render the same frame.
+    if (advance) crossfadeProgress_++;
 
-    std::vector<RGBColor> blended;
-    blended.reserve(colors.size());
-    for (int i = 0; i < (int)colors.size(); i++) {
-        if (i < (int)crossfadeFrom_.size())
-            blended.push_back(RGBColor::lerp(crossfadeFrom_[i], colors[i], t));
-        else
-            blended.push_back(colors[i]);
-    }
-    return blended;
+    const int m = std::min(n, crossfadeFromCount_);
+    for (int i = 0; i < m; ++i)
+        colors[i] = RGBColor::lerp(crossfadeFrom_[i], colors[i], t);
 }
 
 // ============================================================================

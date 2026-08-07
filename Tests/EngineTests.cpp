@@ -69,6 +69,29 @@ public:
             expect(p.getColor(0, 0) == RGBColor{1, 0, 0});
         }
 
+        beginTest("getStepColorsInto matches getStepColors and honours bounds");
+        {
+            Pattern p("t", 4, 6, 4);
+            for (int seg = 0; seg < 6; ++seg)
+                p.setColor(2, seg, {(uint8_t)(seg + 1), 0, 0});
+
+            RGBColor buf[16];
+            int n = p.getStepColorsInto(2, buf, 16);
+            expectEquals(n, 6);
+            auto want = p.getStepColors(2);
+            for (int i = 0; i < n; ++i) expect(buf[i] == want[(size_t)i]);
+
+            // Truncation
+            n = p.getStepColorsInto(2, buf, 3);
+            expectEquals(n, 3);
+            expect(buf[2] == RGBColor{3, 0, 0});
+
+            // Out-of-range step yields black, like getStepColors
+            n = p.getStepColorsInto(99, buf, 16);
+            expectEquals(n, 6);
+            for (int i = 0; i < n; ++i) expect(buf[i] == RGBColor{});
+        }
+
         beginTest("copy/paste range clamps and preserves");
         {
             Pattern p("t", 8, 2, 4);
@@ -161,6 +184,35 @@ public:
         {
             FixtureConfig fix("t", 8, 0, 9999);
             expect(&fix.profile() == &getFixtureProfiles()[0]);
+        }
+
+        beginTest("allocation-free mapping matches the vector API exactly");
+        {
+            // The realtime path uses mapColorsToDmxInto(); the UI and export
+            // paths use mapColorsToDmx(). They must never diverge.
+            for (int profileIdx = 0; profileIdx < 2; ++profileIdx) {
+                FixtureConfig fix("t", 3, 0, profileIdx);
+                std::vector<RGBColor> colors{{10, 200, 30}, {0, 0, 0}, {255, 128, 64}};
+
+                auto want = fix.mapColorsToDmx(colors);
+                std::pair<int,int> got[256];
+                const int n = fix.mapColorsToDmxInto(colors.data(), (int)colors.size(),
+                                                     got, 256);
+                expectEquals(n, (int)want.size());
+                for (int i = 0; i < n; ++i) {
+                    expectEquals(got[i].first,  want[(size_t)i].first);
+                    expectEquals(got[i].second, want[(size_t)i].second);
+                }
+            }
+        }
+
+        beginTest("mapColorsToDmxInto respects its output bound");
+        {
+            FixtureConfig fix("t", 8, 0, 0);
+            std::vector<RGBColor> colors(8, RGBColor{1, 2, 3});
+            std::pair<int,int> got[5];
+            const int n = fix.mapColorsToDmxInto(colors.data(), 8, got, 5);
+            expect(n <= 5, "must never write past maxOut");
         }
     }
 };
