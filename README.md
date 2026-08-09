@@ -183,7 +183,7 @@ Any of the automatable parameters (Master Dimmer, Hue, Swing, Blackout, Pattern,
 
 ## Version history
 
-Release notes live alongside this README: [1.2.1](RELEASE_NOTES_v1.2.1.md) · [1.2.0](RELEASE_NOTES_v1.2.0.md) · [1.1.0](RELEASE_NOTES_v1.1.0.md) · [1.0.0](RELEASE_NOTES_v1.0.0.md)
+See [CHANGELOG.md](CHANGELOG.md) for a summary of every version, or the full release notes: [1.2.1](RELEASE_NOTES_v1.2.1.md) · [1.2.0](RELEASE_NOTES_v1.2.0.md) · [1.1.0](RELEASE_NOTES_v1.1.0.md) · [1.0.0](RELEASE_NOTES_v1.0.0.md) · [1.0-beta.2](RELEASE_NOTES_v1.0-beta.2.md)
 
 ---
 
