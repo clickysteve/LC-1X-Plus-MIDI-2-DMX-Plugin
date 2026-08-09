@@ -4,7 +4,7 @@
 
 By Stephen McLeod (aka [allmyfriendsaresynths](https://www.youtube.com/c/allmyfriendsaresynths))
 
-**Version:** 1.0.0
+**Version:** 1.2.1
 **Formats:** Audio Unit (`.component`) · VST3 (`.vst3`) · Standalone (`.app`)
 **Platforms:** macOS (Universal Binary — Apple Silicon + Intel, signed & notarised) · Windows (64-bit VST3 + Standalone, built via GitHub Actions)
 
@@ -16,7 +16,7 @@ By Stephen McLeod (aka [allmyfriendsaresynths](https://www.youtube.com/c/allmyfr
 
 ## What it does
 
-Inspired by the LC-1X+ MIDI to DMX converter from [BoomLights](https://www.boomlights.ca/), this plugin gives you a proper step-sequencer-style grid inside your DAW to let you control DMX lighting fixtures, synchronised via MIDI clock.
+Inspired by the LC-1X+ MIDI to DMX converter from [BoomLights](https://www.boomlights.ca/), this plugin gives you a proper step-sequencer-style grid inside your DAW to let you control DMX lighting fixtures, synchronised to your session.
 
 Draw patterns, flood colours, store scenes, and play whole lighting songs — all from a single plugin instance that sits on a MIDI track next to your music.
 
@@ -31,10 +31,27 @@ Draw patterns, flood colours, store scenes, and play whole lighting songs — al
 - **Copy / paste / undo / redo** — per-pattern editing with history
 - **Hue shift** — live global hue rotation with a recycle-reset button
 - **Crossfade** — smooth between steps instead of hard-switching
-- **Auto-reset on stop** — when the DAW (or external MIDI clock) stops, patterns snap back to step 1
-- **MIDI clock sync** — locks to incoming MIDI clock for rock-solid timing
+- **Auto-reset on stop** — when the transport stops, patterns snap back to step 1
+- **Three clock sources** — Internal, MIDI Clock, or **Host Sync**
+- **Host-automatable parameters** — Master Dimmer, Hue, Swing, Blackout, Pattern and Flood all appear as automation lanes in your DAW
 - **MIDI Learn** — map scenes, FLOOD, and transport to hardware controllers
 - **State persistence** — everything saves with your DAW project
+
+### Sync
+
+The **Clock** selector offers three sources:
+
+| Source | Behaviour |
+|---|---|
+| Internal | Free-running at the plugin's own BPM. Useful without a host transport. |
+| MIDI Clock | Locks to incoming MIDI clock, for hardware sequencers and external masters. |
+| Host Sync | Derives every step from the host's musical position (PPQ). Sample-accurate, survives tempo changes, and re-locks instantly on loop and locate. Recommended in a DAW. |
+
+Swing is applied as a fractional step offset in all three modes.
+
+### Under the hood
+
+Since 1.2.1 the render path is realtime-safe: no allocation, no locks on the device, and no blocking MIDI I/O on the audio thread. Output is handed to a dedicated sender thread through a lock-free queue, and the zero-allocation guarantee is enforced by tests that count real allocations rather than assuming. See `CODE_REVIEW_v1.2.md` for the full audit, including the issues that are knowingly still open.
 
 ## How it works
 
@@ -50,7 +67,7 @@ Grab the latest from the [Releases page](https://github.com/clickysteve/LC-1X-Pl
 
 All macOS binaries are **signed with a Developer ID certificate and notarised by Apple** — no Gatekeeper warnings, no `xattr -cr` workarounds, works offline.
 
-Download **`LC-1X+ MIDI2DMX-1.0.0.pkg`** and double-click it. The installer walks you through a normal macOS install and places all three formats in the correct locations:
+Download **`LC-1X+ MIDI2DMX-1.2.1.pkg`** and double-click it. The installer walks you through a normal macOS install and places all three formats in the correct locations:
 
 | Format | Installed to | Used by |
 |---|---|---|
@@ -73,17 +90,17 @@ Unzip with Finder or `ditto -x -k <file>.zip .` — avoid plain `unzip`, which c
 ### Verify the notarisation (optional)
 
 ```bash
-xcrun stapler validate "LC-1X+ MIDI2DMX-1.0.0.pkg"
+xcrun stapler validate "LC-1X+ MIDI2DMX-1.2.1.pkg"
 # → The validate action worked!
 ```
 
 ### If Logic says the plugin failed validation
 
-Force an Audio Unit cache rescan and run `auval` manually:
+Force an Audio Unit cache rescan and run `auval` manually. Note the AU type is `aumi` (MIDI processor), not `aumf`:
 
 ```bash
 killall -9 AudioComponentRegistrar
-auval -v aumf Dmxl Amfs
+auval -v aumi Dmxl Amfs
 ```
 
 ### Windows
@@ -104,7 +121,7 @@ Restart your DAW and rescan plugins. The plugin appears under **AMFAS → LC-1X+
 
 ## Build from source (developers)
 
-Requires: macOS, Xcode, CMake ≥ 3.22, and [JUCE](https://github.com/juce-framework/JUCE) (GPL build).
+Requires: macOS, Xcode, CMake ≥ 3.22, and [JUCE](https://github.com/juce-framework/JUCE) (GPL build). JUCE is pinned to **8.0.12**.
 
 ```bash
 # 1. Clone this repo
@@ -112,7 +129,7 @@ git clone https://github.com/clickysteve/LC-1X-Plus-MIDI-2-DMX-Plugin.git
 cd LC-1X-Plus-MIDI-2-DMX-Plugin
 
 # 2. Clone JUCE into the project folder (JUCE is not vendored — GPL hygiene)
-git clone --depth 1 https://github.com/juce-framework/JUCE.git
+git clone --depth 1 --branch 8.0.12 https://github.com/juce-framework/JUCE.git
 
 # 3. Configure and build (unsigned — fine for local dev)
 cmake -B build -G Xcode
@@ -129,12 +146,24 @@ killall -9 AudioComponentRegistrar
 Then open Logic and validate:
 
 ```bash
-auval -v aumf Dmxl Amfs
+auval -v aumi Dmxl Amfs
 ```
+
+### Tests
+
+A headless unit-test runner covers the pattern engine, DMX channel mapping, MIDI clock and Host Sync timing, parameters, persistence, scenes, crossfade, and allocation counting on the audio path.
+
+```bash
+cmake -B build -DLC1X_BUILD_TESTS=ON
+cmake --build build --target LC1XTests -j8
+./build/LC1XTests_artefacts/LC1XTests    # Release/ subdir if CMAKE_BUILD_TYPE is set
+```
+
+GitHub Actions runs these on every push, alongside `auval` and `pluginval` (strictness 10) on macOS.
 
 ### Producing signed, notarised release artefacts
 
-If you have a Developer ID Application cert, a Developer ID Installer cert, and a notarytool keychain profile set up, `release.sh` at the repo root will build all three formats, sign them, notarise each bundle and the `.pkg` installer, staple the tickets, and drop the results into `dist/`.
+If you have a Developer ID Application cert, a Developer ID Installer cert, and a notarytool keychain profile set up, `release.sh` at the repo root will build all three formats, sign them, notarise each bundle and the `.pkg` installer, staple the tickets, and drop the results into `dist/`. The version is read from `CMakeLists.txt`, so bump it there and nowhere else.
 
 See `release.sh` for the full flow. The CMake cache variable `LC1X_CODESIGN_IDENTITY` gates the post-build code signing — leave it empty (default) for unsigned local dev builds.
 
@@ -145,7 +174,16 @@ See `release.sh` for the full flow. The CMake cache variable `LC1X_CODESIGN_IDEN
 1. Create a new **External MIDI** or **Software Instrument** track.
 2. In the channel strip's **MIDI FX** slot, insert **AMFAS → LC-1X+ MIDI2DMX**.
 3. In the plugin's MIDI output settings, route to the MIDI port connected to your LC-1X+.
-4. Hit Play — the grid will step in time with Logic's transport.
+4. Set **Clock** to **Host Sync**.
+5. Hit Play — the grid will step in time with Logic's transport.
+
+Any of the automatable parameters (Master Dimmer, Hue, Swing, Blackout, Pattern, Flood) can be recorded or drawn into an automation lane on that track.
+
+---
+
+## Version history
+
+Release notes live alongside this README: [1.2.1](RELEASE_NOTES_v1.2.1.md) · [1.2.0](RELEASE_NOTES_v1.2.0.md) · [1.1.0](RELEASE_NOTES_v1.1.0.md) · [1.0.0](RELEASE_NOTES_v1.0.0.md)
 
 ---
 
