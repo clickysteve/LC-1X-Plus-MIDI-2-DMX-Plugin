@@ -93,6 +93,22 @@ public:
     // reflect the host's tempo while MIDI clock mode is active.
     std::atomic<double> hostBpm {120.0};
 
+    // ==== Host Sync diagnostics ====
+    // Host Sync is the one clock that depends entirely on the host: it needs
+    // processBlock to be called AND the host to report a transport position.
+    // When either is missing the plugin can only sit there doing nothing,
+    // which is indistinguishable from a bug. These counters let the editor
+    // say which of the two it is. Written on the audio thread, read by the
+    // editor's timer; relaxed atomics are fine, they're only for display.
+    std::atomic<int>    hostDiagBlocks       {0};   // processBlock calls seen
+    std::atomic<int>    hostDiagSteps        {0};   // steps emitted from PPQ
+    std::atomic<bool>   hostDiagHavePlayhead {false};
+    std::atomic<bool>   hostDiagHavePpq      {false};
+    std::atomic<bool>   hostDiagPpqDerived   {false};  // inferred, not reported
+    std::atomic<bool>   hostDiagPlaying      {false};
+    std::atomic<bool>   hostDiagPlayInferred {false};  // motion, not reported
+    std::atomic<double> hostDiagPpq          {0.0};
+
     // ==== Live global controls ====
     std::atomic<float> masterDimmer {1.0f};   // 0..1
     std::atomic<float> hueShiftDeg  {0.0f};   // -180..+180
@@ -104,6 +120,34 @@ public:
     std::atomic<bool>     floodMode   {false};
     std::atomic<bool>     floodActive {false};
     std::atomic<uint32_t> floodColor  {0};
+
+    // ==== Fill (per-fixture live override) ====
+    // FLOOD is the rig-wide "everything, this colour, now" control. FILL is
+    // the same gesture scoped to one fixture, and every fixture keeps its
+    // own, so you can hold several colours across the rig at once. The state
+    // itself lives on FixtureConfig (fillActive / fillColor, guarded by
+    // dataLock); these are the controls the UI and MIDI-learn drive.
+    //
+    // fillMode: if true, clicking a colour button fills the selected fixture
+    // instead of painting into the pattern.
+    std::atomic<bool> fillMode {false};
+
+    /// Set the selected fixture's fill. Takes dataLock; safe from any thread.
+    void setFillForActiveFixture(bool active, uint32_t packedColor);
+    /// Clear every fixture's fill in one gesture.
+    void clearAllFills();
+    /// True if any fixture is currently holding a fill.
+    /// Caller must hold dataLock (computeDmxState already does).
+    bool anyFillActive() const;
+
+    /// Current DMX value (0..255) on one of the 128 channels. Out-of-range
+    /// channels read as 0. Caller should hold dataLock. Used by the tests and
+    /// available for diagnostics.
+    int dmxValueAt(int channel) const;
+
+    /// Re-render and emit the current frame without advancing crossfades.
+    /// Takes dataLock; safe from any thread.
+    void forceRecompute();
     std::atomic<float> swing         {0.0f};  // 0..0.5
 
     // ==== Undo / Redo ====
@@ -242,6 +286,18 @@ private:
     juce::int64 lastHostStep_  = -1;
     bool        hostStepValid_ = false;
     void applyHostStep(juce::int64 globalStep);   // caller holds dataLock
+
+    // Playhead-motion tracking. JUCE's PositionInfo::getIsPlaying() returns a
+    // plain bool, so a host that never fills it in is indistinguishable from
+    // one that is genuinely stopped. If the host has never once claimed to be
+    // playing but its position is advancing, believe the position.
+    double lastHostPpq_      = 0.0;
+    bool   lastHostPpqValid_ = false;
+    bool   hostEverReportedPlaying_ = false;
+    // Consecutive blocks the position has advanced. Scrubbing a stopped
+    // playhead moves it too, so require a short run before believing it.
+    int    hostPpqAdvancingBlocks_ = 0;
+    static constexpr int kInferPlayingBlocks = 3;
 
     // --- APVTS plumbing ---
     void parameterChanged(const juce::String& parameterID, float newValue) override;

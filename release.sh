@@ -6,7 +6,8 @@
 #   * LC-1X+ MIDI2DMX.component.zip      (AU, drag-install)
 #   * LC-1X+ MIDI2DMX.vst3.zip           (VST3, drag-install)
 #   * LC-1X+ MIDI2DMX.app.zip            (Standalone, drag-install)
-#   * LC-1X+ MIDI2DMX-<version>.pkg      (installer: puts all 3 in the right places)
+#   * LC-1X+ Quick Light.app.zip         (menu bar app, drag-install)
+#   * LC-1X+ MIDI2DMX-<version>.pkg      (installer: puts all 4 in the right places)
 #
 # Prereqs (one-time):
 #   1. Developer ID Application cert installed in login keychain.
@@ -26,6 +27,8 @@ NOTARY_PROFILE="LC1X_NOTARY"
 BUILD_DIR="build-release"
 CONFIG="Release"
 ARTEFACTS="${BUILD_DIR}/DMXLightController_artefacts/${CONFIG}"
+QUICKLIGHT_ARTEFACTS="${BUILD_DIR}/LC1XQuickLight_artefacts/${CONFIG}"
+QUICKLIGHT="LC-1X+ Quick Light"
 OUT_DIR="dist"
 PRODUCT="LC-1X+ MIDI2DMX"
 BUNDLE_ID="com.amfas.lc1xplusmidi2dmx"
@@ -94,10 +97,12 @@ notarise_bundle () {
 AU_BUNDLE="${ARTEFACTS}/AU/${PRODUCT}.component"
 VST3_BUNDLE="${ARTEFACTS}/VST3/${PRODUCT}.vst3"
 APP_BUNDLE="${ARTEFACTS}/Standalone/${PRODUCT}.app"
+QL_BUNDLE="${QUICKLIGHT_ARTEFACTS}/${QUICKLIGHT}.app"
 
 notarise_bundle "${AU_BUNDLE}"
 notarise_bundle "${VST3_BUNDLE}"
 notarise_bundle "${APP_BUNDLE}"
+notarise_bundle "${QL_BUNDLE}"
 
 # ============================================================
 # 3. Build a signed .pkg installer containing all three bundles
@@ -115,6 +120,7 @@ mkdir -p "${STAGE}/Applications"
 ditto "${AU_BUNDLE}"   "${STAGE}/Library/Audio/Plug-Ins/Components/${PRODUCT}.component"
 ditto "${VST3_BUNDLE}" "${STAGE}/Library/Audio/Plug-Ins/VST3/${PRODUCT}.vst3"
 ditto "${APP_BUNDLE}"  "${STAGE}/Applications/${PRODUCT}.app"
+ditto "${QL_BUNDLE}"   "${STAGE}/Applications/${QUICKLIGHT}.app"
 
 PKG_PATH="${OUT_DIR}/${PRODUCT}-${VERSION}.pkg"
 COMPONENT_PLIST="${BUILD_DIR}/component.plist"
@@ -126,7 +132,12 @@ COMPONENT_PLIST="${BUILD_DIR}/component.plist"
 # the install there instead of the pkg's payload path.
 echo ">>> Analysing payload to disable bundle relocation"
 pkgbuild --analyze --root "${STAGE}" "${COMPONENT_PLIST}"
-for i in 0 1 2; do
+# Derive the entry count rather than hardcoding it — the payload has grown
+# once already and a stale count silently leaves a bundle relocatable.
+NUM_COMPONENTS="$(plutil -convert json -o - "${COMPONENT_PLIST}" \
+    | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+echo "    payload has ${NUM_COMPONENTS} bundle(s)"
+for (( i=0; i<NUM_COMPONENTS; i++ )); do
     plutil -replace "${i}.BundleIsRelocatable" -bool false "${COMPONENT_PLIST}"
 done
 

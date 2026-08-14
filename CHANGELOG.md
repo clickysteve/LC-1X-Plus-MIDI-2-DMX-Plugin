@@ -8,6 +8,34 @@ reads it from there.
 
 ---
 
+## [1.3.0] — Host Sync fixed, per-fixture FILL, menu bar app
+
+Full notes: [RELEASE_NOTES_v1.3.0.md](RELEASE_NOTES_v1.3.0.md)
+
+**Fixed: Host Sync did nothing in Logic.** It assumed the host would always
+report a musical position and had no fallback when it didn't, so it sat
+silent while the other two clocks (which need nothing from the host) kept
+working. The position is now derived from the timeline and tempo, and then
+from the sample position, when PPQ isn't reported; a rolling transport is
+inferred from a moving playhead for hosts that never report one; and step
+scheduling no longer depends on the audio buffer's shape. A readout in the
+transport row now shows what the DAW is actually providing, including the
+case the plugin can't fix — the host not rendering it at all.
+
+**Added: FILL.** FLOOD lights the whole rig one colour; FILL does the same
+to one fixture, and each fixture keeps its own, so several colours can be
+held across the rig at once. UI and MIDI Learn driven, saved with the
+project. FLOOD still overrides it, BLACKOUT still kills it. The pattern-
+editing button previously called Fill is now Fill Grid.
+
+**Added: LC-1X+ Quick Light**, a menu bar app for turning the rig on
+without opening a DAW. Colour, brightness, MIDI output and a rig setup
+window; shares the plugin's fixture profiles; blacks out on quit.
+
+**Tests** — 41 cases to 56. The Host Sync regression tests fail against
+1.2.1 and pass here, including one that guards against treating the audio
+engine's free-running sample clock as a timeline position.
+
 ## [1.2.1] — realtime-safety and performance pass
 
 Full notes: [RELEASE_NOTES_v1.2.1.md](RELEASE_NOTES_v1.2.1.md) ·

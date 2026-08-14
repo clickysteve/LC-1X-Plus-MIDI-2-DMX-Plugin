@@ -27,8 +27,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libasound2-dev libx11-dev libxext-dev \
-            libxrandr-dev libxcursor-dev libxinerama-dev libfreetype6-dev \
-            libfontconfig1-dev
+            libxrandr-dev libxcursor-dev libxinerama-dev libxcomposite-dev \
+            libfreetype6-dev libfontconfig1-dev mesa-common-dev libglu1-mesa-dev
 
       - name: Clone JUCE (pinned)
         run: git clone --branch "$JUCE_TAG" --depth 1 https://github.com/juce-framework/JUCE.git
@@ -41,6 +41,11 @@ jobs:
 
       - name: Run tests
         run: ./build/LC1XTests_artefacts/Release/LC1XTests
+
+      # The menu bar app shares the plugin's fixture model, so a change to
+      # that model must not be allowed to break it unnoticed.
+      - name: Build Quick Light (compile check)
+        run: cmake --build build --target LC1XQuickLight -j"$(nproc)"
 
   # ---------------------------------------------------------------
   # macOS build + auval + pluginval

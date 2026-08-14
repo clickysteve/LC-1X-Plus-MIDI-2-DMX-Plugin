@@ -4,8 +4,8 @@
 
 By Stephen McLeod (aka [allmyfriendsaresynths](https://www.youtube.com/c/allmyfriendsaresynths))
 
-**Version:** 1.2.1
-**Formats:** Audio Unit (`.component`) · VST3 (`.vst3`) · Standalone (`.app`)
+**Version:** 1.3.0
+**Formats:** Audio Unit (`.component`) · VST3 (`.vst3`) · Standalone (`.app`) · Quick Light menu bar app
 **Platforms:** macOS (Universal Binary — Apple Silicon + Intel, signed & notarised) · Windows (64-bit VST3 + Standalone, built via GitHub Actions)
 
 > **Disclaimer:** This is an **unofficial** plugin. It is **not affiliated with, endorsed by, or supported by BoomLights**. The LC-1X+ hardware is their product; this plugin is an independent fan project designed to make it more fun to use inside a DAW.
@@ -28,6 +28,7 @@ Draw patterns, flood colours, store scenes, and play whole lighting songs — al
 - **Scenes A/B/C/D** — snapshot the whole grid state and recall instantly
 - **Song mode** — chain patterns into a timeline that follows your DAW's transport
 - **FLOOD mode** — toggle on, then tap a palette colour to override every fixture with a single live colour (great for one-hit stabs and manual overrides during a set)
+- **FILL mode** — the same gesture scoped to one fixture, with each fixture keeping its own colour, so you can hold several different colours across the rig at once
 - **Copy / paste / undo / redo** — per-pattern editing with history
 - **Hue shift** — live global hue rotation with a recycle-reset button
 - **Crossfade** — smooth between steps instead of hard-switching
@@ -49,6 +50,31 @@ The **Clock** selector offers three sources:
 
 Swing is applied as a fractional step offset in all three modes.
 
+In Host Sync mode the transport row shows what the DAW is actually
+reporting — bar and beat, tempo, and whether it's rolling. If it says the
+host is not processing the plugin, the DAW isn't calling it at all and no
+setting inside the plugin can change that: in Logic, put it in the MIDI FX
+slot of a **Software Instrument** track, which is a track type Logic
+renders.
+
+## Quick Light (menu bar app)
+
+For when you just want the lights on and don't want to open a DAW. It sits
+in the menu bar: click the icon, pick a colour, done. There's a brightness
+submenu, a MIDI output picker, and a **Set up rig...** window where you
+describe your fixtures the same way you do in the plugin — profile, DMX
+start address, segments. It shares the plugin's fixture profiles, including
+custom ones, so a rig described in either addresses the same channels.
+
+The icon is a filled dot in the current colour when the rig is lit and a
+hollow ring when it isn't. It runs as a menu bar agent with no Dock icon,
+never turns the lights on by itself at launch, and blacks the rig out when
+you quit.
+
+Its settings live at
+`~/Library/Application Support/AMFAS/LC-1X+ MIDI2DMX/quicklight.xml`,
+separate from any DAW project.
+
 ### Under the hood
 
 Since 1.2.1 the render path is realtime-safe: no allocation, no locks on the device, and no blocking MIDI I/O on the audio thread. Output is handed to a dedicated sender thread through a lock-free queue, and the zero-allocation guarantee is enforced by tests that count real allocations rather than assuming. See `CODE_REVIEW_v1.2.md` for the full audit, including the issues that are knowingly still open.
@@ -67,13 +93,14 @@ Grab the latest from the [Releases page](https://github.com/clickysteve/LC-1X-Pl
 
 All macOS binaries are **signed with a Developer ID certificate and notarised by Apple** — no Gatekeeper warnings, no `xattr -cr` workarounds, works offline.
 
-Download **`LC-1X+ MIDI2DMX-1.2.1.pkg`** and double-click it. The installer walks you through a normal macOS install and places all three formats in the correct locations:
+Download **`LC-1X+ MIDI2DMX-1.3.0.pkg`** and double-click it. The installer walks you through a normal macOS install and places everything in the correct locations:
 
 | Format | Installed to | Used by |
 |---|---|---|
 | AU | `/Library/Audio/Plug-Ins/Components/` | Logic Pro, GarageBand, MainStage |
 | VST3 | `/Library/Audio/Plug-Ins/VST3/` | Ableton, Cubase, Reaper, Bitwig, Studio One, FL Studio |
 | Standalone | `/Applications/` | Open as a regular Mac app (great for MIDI-controller-only rigs) |
+| Quick Light | `/Applications/` | Menu bar app for turning the rig on without a DAW |
 
 Then relaunch your DAW and rescan plugins. The plugin appears as a MIDI FX under **AMFAS → LC-1X+ MIDI2DMX**.
 
@@ -84,13 +111,14 @@ If you'd rather only install the format you use, grab the relevant `.zip` asset 
 - `LC-1X+ MIDI2DMX.component.zip` → `/Library/Audio/Plug-Ins/Components/`
 - `LC-1X+ MIDI2DMX.vst3.zip` → `/Library/Audio/Plug-Ins/VST3/`
 - `LC-1X+ MIDI2DMX.app.zip` → `/Applications/`
+- `LC-1X+ Quick Light.app.zip` → `/Applications/`
 
 Unzip with Finder or `ditto -x -k <file>.zip .` — avoid plain `unzip`, which can strip the code signature.
 
 ### Verify the notarisation (optional)
 
 ```bash
-xcrun stapler validate "LC-1X+ MIDI2DMX-1.2.1.pkg"
+xcrun stapler validate "LC-1X+ MIDI2DMX-1.3.0.pkg"
 # → The validate action worked!
 ```
 
@@ -183,7 +211,7 @@ Any of the automatable parameters (Master Dimmer, Hue, Swing, Blackout, Pattern,
 
 ## Version history
 
-See [CHANGELOG.md](CHANGELOG.md) for a summary of every version, or the full release notes: [1.2.1](RELEASE_NOTES_v1.2.1.md) · [1.2.0](RELEASE_NOTES_v1.2.0.md) · [1.1.0](RELEASE_NOTES_v1.1.0.md) · [1.0.0](RELEASE_NOTES_v1.0.0.md) · [1.0-beta.2](RELEASE_NOTES_v1.0-beta.2.md)
+See [CHANGELOG.md](CHANGELOG.md) for a summary of every version, or the full release notes: [1.3.0](RELEASE_NOTES_v1.3.0.md) · [1.2.1](RELEASE_NOTES_v1.2.1.md) · [1.2.0](RELEASE_NOTES_v1.2.0.md) · [1.1.0](RELEASE_NOTES_v1.1.0.md) · [1.0.0](RELEASE_NOTES_v1.0.0.md) · [1.0-beta.2](RELEASE_NOTES_v1.0-beta.2.md)
 
 ---
 

@@ -13,17 +13,43 @@
 namespace {
 
 // ---- Fake playhead for Host Sync tests -------------------------------------
+//
+// The flags model what a host actually chooses to report. Not every host
+// fills in every field: an AU host that doesn't answer CallHostBeatAndTempo
+// leaves the PPQ position empty, and one that doesn't answer
+// CallHostTransportState leaves isPlaying stuck at false. Host Sync has to
+// cope with both, so the tests can switch each field off independently.
 struct FakePlayHead : juce::AudioPlayHead {
     juce::Optional<PositionInfo> getPosition() const override {
         PositionInfo p;
-        p.setIsPlaying(playing);
-        p.setBpm(bpm);
-        p.setPpqPosition(ppq);
+        if (reportsBpm) p.setBpm(bpm);
+        if (reportsPpq) p.setPpqPosition(ppq);
+
+        if (reportsTransport) {
+            // JUCE's AU wrapper populates isPlaying, the loop points and a
+            // real timeline position together, off one host callback.
+            p.setIsPlaying(playing);
+            p.setIsLooping(false);
+            p.setLoopPoints(juce::AudioPlayHead::LoopPoints { 0.0, 0.0 });
+            p.setTimeInSamples((juce::int64)std::llround(ppq * 60.0 / bpm * sampleRate));
+        } else {
+            // ...and when that callback fails it falls back to the render
+            // engine's free-running sample clock, with NO loop points. That
+            // counter keeps climbing whether or not anything is playing, so
+            // it must never be mistaken for a timeline.
+            p.setTimeInSamples(engineSamples);
+        }
         return p;
     }
     bool   playing = false;
     double bpm     = 120.0;
     double ppq     = 0.0;
+    double sampleRate = 44100.0;
+    juce::int64 engineSamples = 0;   // free-running, never rewinds
+
+    bool reportsTransport = true;
+    bool reportsBpm       = true;
+    bool reportsPpq       = true;
 };
 
 struct Ev {
@@ -71,6 +97,174 @@ static void setChasePattern(DMXControllerProcessor& p) {
 }
 
 } // namespace
+
+// ----------------------------------------------------------------------------
+// FILL: a per-fixture live colour override. The interesting behaviour is not
+// "does it output a colour" but how it composes with the controls that
+// outrank it, and that one fixture's fill never leaks into another's.
+// ----------------------------------------------------------------------------
+class FillTests : public juce::UnitTest {
+public:
+    FillTests() : UnitTest("Fill (per-fixture override)", "processor") {}
+
+    // Read back the DMX value a fixture's first red channel is holding, by
+    // running a preview and inspecting the note stream.
+    static int redOf(DMXControllerProcessor& p, int fixtureIdx) {
+        const juce::ScopedLock l(p.dataLock);
+        if (fixtureIdx < 0 || fixtureIdx >= (int)p.fixtures.size()) return -1;
+        return p.dmxValueAt(p.fixtures[(size_t)fixtureIdx].dmxStart);
+    }
+
+    void runTest() override {
+        beginTest("fill lights only the fixture it was set on");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.addFixture();                      // two fixtures
+
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0xFF0000);
+
+            expect(redOf(proc, 0) > 200, "fixture 0 is red");
+            expectEquals(redOf(proc, 1), 0, "fixture 1 untouched");
+        }
+
+        beginTest("two fixtures hold two different colours at once");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.addFixture();
+
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0xFF0000);   // red
+            proc.activeFixture.store(1);
+            proc.setFillForActiveFixture(true, 0x0000FF);   // blue
+
+            const juce::ScopedLock l(proc.dataLock);
+            const int f0 = proc.fixtures[0].dmxStart;
+            const int f1 = proc.fixtures[1].dmxStart;
+            expect(proc.dmxValueAt(f0)     > 200, "fixture 0 red channel high");
+            expectEquals(proc.dmxValueAt(f0 + 2), 0, "fixture 0 blue channel off");
+            expectEquals(proc.dmxValueAt(f1), 0,     "fixture 1 red channel off");
+            expect(proc.dmxValueAt(f1 + 2) > 200, "fixture 1 blue channel high");
+        }
+
+        beginTest("flood outranks fill on every fixture");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.addFixture();
+
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0x0000FF);   // blue fill
+            proc.setFloodParams(true, 0);                   // flood (preset 0)
+            // Parameter moves normally re-render via the message thread's
+            // preview, which isn't pumping in a headless test.
+            proc.forceRecompute();
+
+            const juce::ScopedLock l(proc.dataLock);
+            const uint32_t flood = proc.floodColor.load();
+            const int f0 = proc.fixtures[0].dmxStart;
+            expectEquals(proc.dmxValueAt(f0 + 0), (int)((flood >> 16) & 0xFF),
+                         "red channel came from the flood");
+            expectEquals(proc.dmxValueAt(f0 + 2), (int)(flood & 0xFF),
+                         "blue channel came from the flood, not the blue fill");
+        }
+
+        beginTest("blackout outranks fill");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0xFF0000);
+            expect(redOf(proc, 0) > 200);
+
+            proc.apvts.getParameter("blackout")->setValueNotifyingHost(1.0f);
+            proc.forceRecompute();
+            expectEquals(redOf(proc, 0), 0, "blackout kills the fill");
+        }
+
+        beginTest("fill outputs with the transport stopped");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            expect(!proc.isPlaying.load(), "precondition: stopped");
+            proc.setFillForActiveFixture(true, 0x00FF00);
+            expect(redOf(proc, 0) == 0, "red channel off for a green fill");
+
+            const juce::ScopedLock l(proc.dataLock);
+            expect(proc.dmxValueAt(proc.fixtures[0].dmxStart + 1) > 200,
+                   "green channel lit while stopped");
+        }
+
+        beginTest("a fill on one fixture does not wake the others up");
+        {
+            // The gate that lets a fill output while stopped must be per
+            // fixture. If it were rig-wide, filling fixture 0 would lift the
+            // "stopped, output nothing" rule for fixture 1 too, and fixture 1
+            // would light up with whatever step its pattern is parked on —
+            // the opposite of what FILL promises.
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.addFixture();
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                // Give fixture 1 a pattern that is lit at step 0.
+                proc.fixtures[1].patternBank.patterns[0] =
+                    Pattern::chase(16, 8, {0, 255, 0});
+            }
+            expect(!proc.isPlaying.load(), "precondition: stopped");
+
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0xFF0000);
+
+            const juce::ScopedLock l(proc.dataLock);
+            expect(proc.dmxValueAt(proc.fixtures[0].dmxStart) > 200,
+                   "fixture 0 holds its fill");
+            const int f1 = proc.fixtures[1].dmxStart;
+            int lit = 0;
+            for (int ch = f1; ch < f1 + proc.fixtures[1].dmxFootprint(); ++ch)
+                lit += proc.dmxValueAt(ch);
+            expectEquals(lit, 0, "fixture 1 stayed dark");
+        }
+
+        beginTest("clearAllFills releases every fixture");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.addFixture();
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0xFF0000);
+            proc.activeFixture.store(1);
+            proc.setFillForActiveFixture(true, 0xFF0000);
+
+            proc.clearAllFills();
+            expectEquals(redOf(proc, 0), 0);
+            expectEquals(redOf(proc, 1), 0);
+        }
+
+        beginTest("fills survive a state round-trip");
+        {
+            DMXControllerProcessor a, b;
+            a.prepareToPlay(44100.0, 512);
+            b.prepareToPlay(44100.0, 512);
+            a.addFixture();
+            a.activeFixture.store(1);
+            a.setFillForActiveFixture(true, 0x123456);
+
+            juce::MemoryBlock state;
+            a.getStateInformation(state);
+            b.setStateInformation(state.getData(), (int)state.getSize());
+
+            const juce::ScopedLock l(b.dataLock);
+            expectEquals((int)b.fixtures.size(), 2);
+            expect(!b.fixtures[0].fillActive, "fixture 0 had no fill");
+            expect(b.fixtures[1].fillActive,  "fixture 1's fill restored");
+            expectEquals((int)b.fixtures[1].fillColor, 0x123456);
+        }
+    }
+};
+static FillTests fillTests;
 
 // ----------------------------------------------------------------------------
 class MidiClockTests : public juce::UnitTest {
@@ -230,6 +424,159 @@ public:
             runBlock(proc, {});
             expect(!proc.isPlaying.load());
             expectEquals(proc.currentStep.load(), 15);   // default auto-reset = last step
+        }
+
+        // --------------------------------------------------------------
+        // Degraded hosts. Logic reports "nothing at all" through Host Sync
+        // on some track types, which is what these cover: the plugin must
+        // still step from whatever the host does provide.
+        // --------------------------------------------------------------
+        beginTest("a free-running engine clock is never mistaken for a timeline");
+        {
+            // The failure this guards against: JUCE's AU wrapper reports the
+            // render engine's sample counter as the position when the host
+            // doesn't answer the transport callback. That counter climbs on
+            // every block forever. If the plugin treated it as a timeline it
+            // would decide the transport is rolling and never stop — a rig
+            // free-running with no way to halt it from the DAW, which is a
+            // good deal worse than Host Sync doing nothing.
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            ph.reportsPpq       = false;
+            ph.reportsTransport = false;    // → no loop points, engine clock
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            setChasePattern(proc);
+
+            int noteOns = 0;
+            for (int i = 0; i < 40; ++i) {
+                ph.engineSamples += 512;    // the engine clock never stops
+                for (const auto& e : runBlock(proc, {}, 512, i * 512))
+                    if (e.isOn) ++noteOns;
+            }
+            expectEquals(noteOns, 0, "did not free-run off the engine clock");
+            expect(!proc.isPlaying.load(), "transport still reads as stopped");
+            expect(!proc.hostDiagHavePpq.load(),
+                   "diagnostics report no usable position");
+        }
+
+        beginTest("host reports no PPQ: position is derived from the timeline");
+        {
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            ph.reportsPpq = false;          // no CallHostBeatAndTempo ppq
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            setChasePattern(proc);
+
+            ph.playing = true;
+            auto evs = play(proc, ph, 25);
+
+            int s0 = -1, s1 = -1, s2 = -1;
+            for (auto& e : evs) {
+                if (e.isOn && e.note == 0 && s0 < 0) s0 = e.sample;
+                if (e.isOn && e.note == 3 && s1 < 0) s1 = e.sample;
+                if (e.isOn && e.note == 6 && s2 < 0) s2 = e.sample;
+            }
+            expect(s0 >= 0 && s1 >= 0 && s2 >= 0,
+                   "steps still fire with no PPQ from the host");
+            expect(std::abs(s1 - 5513) <= 8, "step 1 near ~5513 (got " + juce::String(s1) + ")");
+            expect(std::abs(s2 - 11025) <= 8, "step 2 near ~11025 (got " + juce::String(s2) + ")");
+        }
+
+        beginTest("host never reports isPlaying: motion of the playhead implies it");
+        {
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            ph.reportsTransport = false;    // no CallHostTransportState
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            setChasePattern(proc);
+
+            ph.playing = true;              // ignored by the playhead
+            auto evs = play(proc, ph, 25);
+
+            int noteOns = 0;
+            for (auto& e : evs) if (e.isOn) ++noteOns;
+            expect(noteOns > 0, "stepped even though the host never said 'playing'");
+            expect(proc.isPlaying.load(), "inferred that the transport is rolling");
+        }
+
+        beginTest("a frozen playhead is not mistaken for playback");
+        {
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            ph.reportsTransport = false;
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            setChasePattern(proc);
+
+            // PPQ never advances: the host is stopped, just silent about it.
+            std::vector<Ev> all;
+            for (int i = 0; i < 12; ++i) {
+                auto evs = runBlock(proc, {}, 512, i * 512);
+                all.insert(all.end(), evs.begin(), evs.end());
+            }
+            int noteOns = 0;
+            for (auto& e : all) if (e.isOn) ++noteOns;
+            expectEquals(noteOns, 0);
+            expect(!proc.isPlaying.load());
+        }
+
+        beginTest("zero-length audio buffer still advances the sequence");
+        {
+            // A MIDI-effect plugin can legitimately be rendered with no
+            // audio channels; nothing about stepping may depend on the
+            // audio buffer's shape.
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            setChasePattern(proc);
+            ph.playing = true;
+
+            const double ppqPerSample = ph.bpm / 60.0 / 44100.0;
+            int noteOns = 0;
+            for (int i = 0; i < 25; ++i) {
+                juce::AudioBuffer<float> audio(0, 0);   // no channels, no samples
+                juce::MidiBuffer m;
+                proc.processBlock(audio, m);
+                for (const auto meta : m)
+                    if (meta.getMessage().isNoteOn()) ++noteOns;
+                ph.ppq += ppqPerSample * 512;
+            }
+            expect(noteOns > 0, "stepped with an empty audio buffer");
+        }
+
+        beginTest("diagnostics report what the host actually provided");
+        {
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            setChasePattern(proc);
+            ph.playing = true;
+            play(proc, ph, 10);
+
+            expect(proc.hostDiagBlocks.load() >= 10, "counted the blocks it saw");
+            expect(proc.hostDiagHavePlayhead.load(), "saw a playhead");
+            expect(proc.hostDiagHavePpq.load(), "saw a PPQ position");
+            expect(proc.hostDiagSteps.load() > 0, "counted the steps it emitted");
+        }
+
+        beginTest("diagnostics show when the plugin is never processed");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            expectEquals(proc.hostDiagBlocks.load(), 0);
+            expect(!proc.hostDiagHavePlayhead.load());
         }
     }
 };

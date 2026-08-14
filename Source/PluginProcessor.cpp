@@ -210,6 +210,52 @@ void DMXControllerProcessor::setFloodParams(bool active, int colorIdx) {
         pFloodActive_->setValueNotifyingHost(active ? 1.0f : 0.0f);
 }
 
+// ============================================================================
+// FILL — per-fixture live colour override
+//
+// Deliberately NOT a host parameter, unlike FLOOD. A parameter has one value
+// per plugin instance, but a fill is per fixture, so "the fill colour" would
+// have to mean "the selected fixture's fill colour" — and then simply
+// changing the selected fixture would appear to the host as an automation
+// move, and recorded automation would fight the selection. FILL is therefore
+// driven by the UI and MIDI-learn only, and saved with the project.
+// ============================================================================
+void DMXControllerProcessor::setFillForActiveFixture(bool active, uint32_t packedColor) {
+    const juce::ScopedLock l(dataLock);
+    const int idx = activeFixture.load();
+    if (idx < 0 || idx >= (int)fixtures.size()) return;
+    fixtures[idx].fillActive = active;
+    if (active) fixtures[idx].fillColor = packedColor;
+
+    computeDmxState();
+    emitDmxDelta(nullptr, 0);
+}
+
+void DMXControllerProcessor::clearAllFills() {
+    const juce::ScopedLock l(dataLock);
+    for (auto& f : fixtures) f.fillActive = false;
+
+    computeDmxState();
+    emitDmxDelta(nullptr, 0);
+}
+
+bool DMXControllerProcessor::anyFillActive() const {
+    for (const auto& f : fixtures)
+        if (f.fillActive) return true;
+    return false;
+}
+
+int DMXControllerProcessor::dmxValueAt(int channel) const {
+    if (channel < 0 || channel >= 128) return 0;
+    return (int)dmxState_[channel];
+}
+
+void DMXControllerProcessor::forceRecompute() {
+    const juce::ScopedLock l(dataLock);
+    computeDmxState(false);
+    emitDmxDelta(nullptr, 0);
+}
+
 PatternBank& DMXControllerProcessor::currentBank() {
     return fixtures[activeFixture].patternBank;
 }
@@ -267,6 +313,24 @@ void DMXControllerProcessor::prepareToPlay(double sr, int) {
     // reserving up front keeps processBlock allocation-free.
     generatedMidi_.ensureSize(4096);
     generatedMidi_.clear();
+
+    // Reset the Host Sync diagnostics. The host calls this when the plugin
+    // is moved, the sample rate changes, or playback is reconfigured — all
+    // of which can change what transport information is available. Latched
+    // flags from a previous configuration would report the old answer and
+    // defeat the point of the readout.
+    hostDiagBlocks.store(0);
+    hostDiagSteps.store(0);
+    hostDiagHavePlayhead.store(false);
+    hostDiagHavePpq.store(false);
+    hostDiagPpqDerived.store(false);
+    hostDiagPlaying.store(false);
+    hostDiagPlayInferred.store(false);
+    hostDiagPpq.store(0.0);
+
+    lastHostPpqValid_        = false;
+    hostEverReportedPlaying_ = false;
+    hostPpqAdvancingBlocks_  = 0;
 }
 
 void DMXControllerProcessor::releaseResources() {}
@@ -363,22 +427,101 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     // We don't sync step timing to the host — only watch the isPlaying
     // transition so that pressing STOP in the DAW can reset the pattern
     // when Auto-reset is enabled.
+    //
+    // Host Sync additionally needs a musical position, and hosts differ in
+    // what they report. Two sources are usable, and the difference between
+    // them is not cosmetic:
+    //
+    //   1. getPpqPosition() — a real musical position. It only advances
+    //      while the transport rolls, so its motion is itself evidence that
+    //      the transport is rolling.
+    //
+    //   2. the timeline position (seconds / samples) × tempo — usable ONLY
+    //      when the host actually answered the transport-state callback.
+    //      JUCE's AU wrapper fills timeInSamples from the render engine's
+    //      free-running sample clock when the host does NOT answer it, and
+    //      that counter advances forever whether or not anything is
+    //      playing. Treating it as a timeline would leave the rig
+    //      free-running with no way to stop it, which is worse than doing
+    //      nothing. getLoopPoints() is the tell: the AU wrapper only
+    //      populates it on the success branch of that same callback, so
+    //      its presence means both isPlaying and the timeline are real.
+    //
+    // If neither is available the plugin cannot sync, and says so in the
+    // diagnostics rather than inventing a position.
     bool   hostPlaying = false;
     bool   havePpq     = false;
+    bool   ppqDerived  = false;
     double ppq         = 0.0;
+    const double srateNow = sampleRate_ > 0.0 ? sampleRate_ : 44100.0;
+
+    hostDiagBlocks.fetch_add(1, std::memory_order_relaxed);
+
+    bool sawPlayhead = false;
     if (auto* ph = getPlayHead()) {
         if (auto pos = ph->getPosition()) {
+            sawPlayhead = true;
             hostPlaying = pos->getIsPlaying();
+
             // Expose the host tempo so the editor can mirror it when the
             // plugin is running in MIDI Clock or Host Sync mode.
             if (auto hostBpmOpt = pos->getBpm())
-                hostBpm.store(*hostBpmOpt);
+                if (*hostBpmOpt > 0.0)
+                    hostBpm.store(*hostBpmOpt);
+
             if (auto ppqOpt = pos->getPpqPosition()) {
                 ppq     = *ppqOpt;
                 havePpq = true;
+            } else if (pos->getLoopPoints().hasValue()) {
+                // Transport state was genuinely reported, so the timeline
+                // position is a timeline position and isPlaying is real.
+                const double bpmNow = hostBpm.load() > 0.0 ? hostBpm.load() : 120.0;
+                if (auto secsOpt = pos->getTimeInSeconds()) {
+                    ppq        = *secsOpt * bpmNow / 60.0;
+                    havePpq    = true;
+                    ppqDerived = true;
+                } else if (auto smpOpt = pos->getTimeInSamples()) {
+                    ppq        = ((double)*smpOpt / srateNow) * bpmNow / 60.0;
+                    havePpq    = true;
+                    ppqDerived = true;
+                }
+            }
+
+            // A host that never answers the transport callback leaves
+            // isPlaying permanently false. Only a REPORTED musical position
+            // can stand in for it — a derived one comes from a source we
+            // already know the host is answering properly. Require a few
+            // consecutive advancing blocks so scrubbing the playhead while
+            // stopped doesn't read as playback.
+            if (hostPlaying) {
+                hostEverReportedPlaying_ = true;
+                hostPpqAdvancingBlocks_  = 0;
+            } else if (!hostEverReportedPlaying_ && havePpq && !ppqDerived) {
+                if (lastHostPpqValid_ && ppq > lastHostPpq_ + 1.0e-9) {
+                    if (hostPpqAdvancingBlocks_ < kInferPlayingBlocks)
+                        ++hostPpqAdvancingBlocks_;
+                } else {
+                    hostPpqAdvancingBlocks_ = 0;
+                }
+                if (hostPpqAdvancingBlocks_ >= kInferPlayingBlocks) {
+                    hostPlaying = true;
+                    hostDiagPlayInferred.store(true, std::memory_order_relaxed);
+                }
+            }
+
+            if (havePpq) {
+                lastHostPpq_      = ppq;
+                lastHostPpqValid_ = true;
             }
         }
     }
+
+    if (!hostPlaying) hostDiagPlayInferred.store(false, std::memory_order_relaxed);
+    hostDiagHavePlayhead.store(sawPlayhead, std::memory_order_relaxed);
+    hostDiagHavePpq.store(havePpq, std::memory_order_relaxed);
+    hostDiagPpqDerived.store(ppqDerived, std::memory_order_relaxed);
+    hostDiagPlaying.store(hostPlaying, std::memory_order_relaxed);
+    hostDiagPpq.store(ppq, std::memory_order_relaxed);
 
     // DMX note deltas generated during this block (MIDI-clock-driven step
     // advances, transport resets) are collected here and handed back to
@@ -427,7 +570,14 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                         return k;
                     };
 
-                    const double      blockEnd = ppq + ppqPerSample * buffer.getNumSamples();
+                    // A MIDI-effect plugin can be rendered with no audio
+                    // channels and, in some hosts, a zero-length buffer.
+                    // Step scheduling must not depend on the audio buffer's
+                    // shape, so fall back to the prepared block size.
+                    const int nSamples = buffer.getNumSamples() > 0
+                                       ? buffer.getNumSamples()
+                                       : juce::jmax(1, getBlockSize());
+                    const double      blockEnd = ppq + ppqPerSample * nSamples;
                     const juce::int64 stepNow  = stepAtPpq(ppq);
 
                     // Re-lock on start, backward jumps (loop) or big forward
@@ -448,10 +598,11 @@ void DMXControllerProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                          stepStartPpq(n) < blockEnd && emitted < kMaxStepsPerBlock;
                          ++n, ++emitted) {
                         const double off = (stepStartPpq(n) - ppq) / ppqPerSample;
-                        hostSamplePos_ = juce::jlimit(0, juce::jmax(0, buffer.getNumSamples() - 1),
+                        hostSamplePos_ = juce::jlimit(0, juce::jmax(0, nSamples - 1),
                                                       (int)std::llround(off));
                         applyHostStep(n);
                         lastHostStep_ = n;
+                        hostDiagSteps.fetch_add(1, std::memory_order_relaxed);
                     }
                     hostSamplePos_ = 0;
                 }
@@ -863,8 +1014,18 @@ void DMXControllerProcessor::computeDmxState(bool advanceFades) {
     std::memset(dmxState_, 0, sizeof(dmxState_));
 
     if (blackoutActive.load()) return;      // hard kill, but transport keeps running
-    // Flood is a live override that should output even when stopped
-    if (!isPlaying.load() && !previewRequested.load() && !floodActive.load()) return;
+
+    // Flood and fill are live overrides that must output even when the
+    // transport is stopped — that's the whole point of them: you hold a
+    // colour up while nothing is playing.
+    //
+    // The distinction matters per fixture, not for the rig as a whole. A
+    // fill on ONE fixture must not wake the others up: if it lifted the
+    // gate globally, every un-filled fixture would start outputting
+    // whatever step its pattern happens to be parked on.
+    const bool globalLive = isPlaying.load() || previewRequested.load()
+                         || floodActive.load();
+    if (!globalLive && !anyFillActive()) return;
 
     int step = currentStep.load();
 
@@ -895,14 +1056,28 @@ void DMXControllerProcessor::computeDmxState(bool advanceFades) {
         auto& fixture = fixtures[fi];
         int n = 0;
 
-        if (flood) {
-            // FLOOD is an ALL-fixtures override. Every fixture in the rig
-            // gets the flood colour, mapped through its OWN channel layout
-            // (the mapping honours {d,r,g,b} par cans, RGBW fixtures, etc.),
-            // so mixed rigs flood correctly across differing channel
-            // offsets.
+        // FILL is FLOOD scoped to one fixture: each fixture holds its own
+        // colour, so the rig can show several at once. FLOOD still wins,
+        // because it's the "everything, now" control.
+        const bool fillThis = !flood && fixture.fillActive;
+        const RGBColor fillCol = {
+            (uint8_t)((fixture.fillColor >> 16) & 0xFF),
+            (uint8_t)((fixture.fillColor >>  8) & 0xFF),
+            (uint8_t)( fixture.fillColor        & 0xFF)
+        };
+        const bool overridden = flood || fillThis;
+
+        // Stopped, with no flood or preview: only filled fixtures output.
+        if (!overridden && !globalLive) continue;
+
+        if (overridden) {
+            // An override paints every segment of this fixture one colour,
+            // mapped through its OWN channel layout (the mapping honours
+            // {d,r,g,b} par cans, RGBW fixtures, etc.), so mixed rigs
+            // override correctly across differing channel offsets.
             n = std::clamp(fixture.numSegments, 1, kMaxSegments);
-            for (int i = 0; i < n; ++i) colorBuf_[i] = floodCol;
+            const RGBColor c = flood ? floodCol : fillCol;
+            for (int i = 0; i < n; ++i) colorBuf_[i] = c;
         } else {
             auto* pat = fixture.patternBank.current();
             if (!pat) continue;      // normal playback still needs a pattern
@@ -916,11 +1091,11 @@ void DMXControllerProcessor::computeDmxState(bool advanceFades) {
                 applyCrossfadeInPlace(colorBuf_, n, advanceFades);
         }
 
-        // Apply hue shift (skipped for flood so the chosen colour stays
+        // Apply hue shift (skipped for flood/fill so the chosen colour stays
         // exact), then master + per-fixture brightness
         const float trim = master * fixture.brightnessOffset;
         for (int i = 0; i < n; ++i) {
-            if (!flood) colorBuf_[i] = applyHueSat(colorBuf_[i], hue, 1.0f);
+            if (!overridden) colorBuf_[i] = applyHueSat(colorBuf_[i], hue, 1.0f);
             colorBuf_[i] = applyTrim(colorBuf_[i], trim);
         }
 
@@ -1103,6 +1278,7 @@ void DMXControllerProcessor::writeState(juce::MemoryBlock& dest, bool includeSce
     xml->setAttribute("swing",         (double)swing.load());
     xml->setAttribute("autoResetMode", (int)autoResetMode.load());
     xml->setAttribute("floodMode",       (bool)floodMode.load());
+    xml->setAttribute("fillMode",        (bool)fillMode.load());
 
     // Host-automatable parameters. The scalar attributes above are still
     // written so files stay readable by older plugin versions, but PARAMS
@@ -1119,6 +1295,8 @@ void DMXControllerProcessor::writeState(juce::MemoryBlock& dest, bool includeSce
         f->setAttribute("profile",  fix.profileIndex);
 
         f->setAttribute("brightOff", (double)fix.brightnessOffset);
+        f->setAttribute("fillOn",    fix.fillActive);
+        f->setAttribute("fillCol",   (int)fix.fillColor);
 
         auto* patsXml = f->createNewChildElement("Patterns");
         for (auto& pat : fix.patternBank.patterns) {
@@ -1203,6 +1381,10 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
     else
         autoResetMode.store(xml->getBoolAttribute("autoResetOnStop", false) ? 1 : 0);
     floodMode.store(xml->getBoolAttribute("floodMode", false));
+    // Restored with the fills themselves, so reloading a session with fills
+    // up leaves the FILL button armed and the colour buttons still able to
+    // release them. Without this the fills come back lit but unreachable.
+    fillMode.store(xml->getBoolAttribute("fillMode", false));
     // (floodActive/floodColor are parameters now and restore with PARAMS
     // below, like any other automatable value.)
     savedOut = xml->getStringAttribute("midiOutDevice");
@@ -1223,6 +1405,8 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
                 || fix.profileIndex >= (int)getFixtureProfiles().size())
                 fix.profileIndex = 0;
             fix.brightnessOffset = (float)f->getDoubleAttribute("brightOff", 1.0);
+            fix.fillActive       = f->getBoolAttribute("fillOn", false);
+            fix.fillColor        = (uint32_t)f->getIntAttribute("fillCol", 0);
 
             if (auto* patsXml = f->getChildByName("Patterns")) {
                 fix.patternBank.patterns.clear();
@@ -1465,6 +1649,8 @@ juce::String DMXControllerProcessor::serializeFixture(int idx) const {
     obj->setProperty("dmxStart",   fix.dmxStart);
     obj->setProperty("profile",    fix.profileIndex);
     obj->setProperty("brightOff",  (double)fix.brightnessOffset);
+    obj->setProperty("fillOn",     fix.fillActive);
+    obj->setProperty("fillCol",    (int)fix.fillColor);
 
     juce::Array<juce::var> patArr;
     for (auto& pat : fix.patternBank.patterns) {
@@ -1503,6 +1689,8 @@ bool DMXControllerProcessor::deserializeFixtureInto(int idx, const juce::String&
         || fix.profileIndex >= (int)getFixtureProfiles().size())
         fix.profileIndex = 0;
     fix.brightnessOffset = (float)(double)parsed.getProperty("brightOff", 1.0);
+    fix.fillActive       = (bool)parsed.getProperty("fillOn",  false);
+    fix.fillColor        = (uint32_t)(int)parsed.getProperty("fillCol", 0);
 
     fix.patternBank.patterns.clear();
     auto pats = parsed.getProperty("patterns", juce::var());

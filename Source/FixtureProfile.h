@@ -83,6 +83,21 @@ struct FixtureConfig {
     float brightnessOffset = 1.0f;     // 0..2 per-fixture trim
     PatternBank patternBank;
 
+    // ---- FILL: per-fixture live colour override ----
+    // FLOOD is a rig-wide override (every fixture, one colour). FILL is the
+    // same idea scoped to a single fixture, so different fixtures can hold
+    // different colours at once. Each fixture keeps its own, which is what
+    // makes "left bar red, right bar blue" possible; the UI only ever edits
+    // the selected fixture's.
+    //
+    // Read on the audio thread from computeDmxState, written from the UI and
+    // MIDI-learn paths. Guarded by the processor's dataLock, exactly like
+    // numSegments and dmxStart — not atomics, because FixtureConfig has to
+    // stay copyable for the fixtures vector (duplicate, erase, deserialise).
+    // Precedence is BLACKOUT > FLOOD > FILL > pattern.
+    bool     fillActive = false;
+    uint32_t fillColor  = 0;           // packed 0x00RRGGBB
+
     FixtureConfig(const std::string& n = "Fixture 1",
                   int segs = 8, int start = 0, int profile = 0)
         : name(n), numSegments(segs), dmxStart(start), profileIndex(profile) {}

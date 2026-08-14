@@ -104,6 +104,11 @@ private:
     juce::Label      bpmLabel;
     juce::Label      clockSrcLabel{"", "Clock:"};
     juce::ComboBox   clockSrcSelector;
+    // Host Sync depends entirely on the host calling us and reporting a
+    // position. When it doesn't, the plugin can only sit there — so this
+    // says which half is missing rather than leaving it a mystery.
+    juce::Label      hostSyncStatus;
+    juce::String     lastHostSyncStatus_;
 
     // ---- Row 2: MIDI In/Out ----
     juce::Label      midiInLabel{"",  "MIDI In:"};
@@ -131,7 +136,10 @@ private:
     juce::TextButton colorBtns[NUM_PRESET_COLORS];
     juce::Slider     brightnessSlider;
     juce::Label      brightnessLabel{"", "Bright"};
-    juce::TextButton fillBtn{"Fill"}, clearBtn{"Clear"}, eraseBtn{"Eraser"};
+    // "Fill Grid" is a pattern EDIT (paints cells). The FILL toggle above is
+    // a live override. They used to both be called Fill, which read as the
+    // same feature twice in one row.
+    juce::TextButton fillBtn{"Fill Grid"}, clearBtn{"Clear"}, eraseBtn{"Eraser"};
     juce::TextButton genBtn{"Generate"};
     juce::TextButton renameFixBtn{"Rename"};
 
@@ -156,6 +164,9 @@ private:
     juce::Label      swingLabel{"", "Swing"};
     juce::Slider     swingSlider;
     juce::ToggleButton floodToggleBtn{"FLOOD"};
+    // FILL is FLOOD scoped to the selected fixture, so several fixtures can
+    // hold different colours at once.
+    juce::ToggleButton fillToggleBtn{"FILL"};
     juce::Label      scenesLabel{"", "Scenes:"};
     juce::TextButton sceneBtns[4];    // A B C D recall
     juce::TextButton sceneStoreBtns[4]; // small store-into-scene
@@ -200,13 +211,16 @@ private:
         bool     blackout  = false;
         bool     flood     = false;
         uint32_t floodCol  = 0;
+        bool     fill      = false;
+        uint32_t fillCol   = 0;
         int      patternId = -1;
         int      fixture   = -1;
         int      songBlock = -1;
         bool operator!=(const VisualState& o) const {
             return step != o.step || hue != o.hue || master != o.master
                 || blackout != o.blackout || flood != o.flood
-                || floodCol != o.floodCol || patternId != o.patternId
+                || floodCol != o.floodCol || fill != o.fill
+                || fillCol != o.fillCol || patternId != o.patternId
                 || fixture != o.fixture || songBlock != o.songBlock;
         }
     };
@@ -235,6 +249,7 @@ private:
     void showNewProfileDialog();
     void confirmAndDeleteCurrentUserProfile();
     void refreshProfileSelector();
+    void updateHostSyncStatus();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DMXControllerEditor)
 };

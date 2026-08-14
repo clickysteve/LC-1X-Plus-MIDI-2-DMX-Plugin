@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(DMXLightController VERSION 1.2.1 LANGUAGES C CXX)
+project(DMXLightController VERSION 1.3.0 LANGUAGES C CXX)
 
 # ---------- macOS universal binary (Intel + Apple Silicon) ----------
 if(APPLE)
@@ -68,6 +68,66 @@ target_link_libraries(DMXLightController
         juce::juce_recommended_warning_flags
 )
 
+# ---------- Quick Light menu bar app ----------
+# A separate, deliberately tiny app for the "I just want the lights on"
+# case — no DAW, no sequencer, one colour across the rig. It shares the
+# plugin's fixture model and DMX-over-MIDI encoding (FixtureProfile.h,
+# PatternData.h, UserProfileStore) so a rig described in one addresses the
+# same channels in the other, but it keeps its own settings file because
+# the plugin's fixture layout lives inside a DAW project.
+option(LC1X_BUILD_QUICKLIGHT "Build the LC-1X+ Quick Light menu bar app" ON)
+
+if(LC1X_BUILD_QUICKLIGHT)
+    # LSUIElement makes it an agent app: it lives in the menu bar and nowhere
+    # else, with no Dock icon. This goes through PLIST_TO_MERGE rather than
+    # MACOSX_BUNDLE_INFO_PLIST, because overriding the latter would throw away
+    # the Info.plist JUCE generates — bundle identifier, version strings and
+    # all — leaving a bundle that codesign and pkgbuild can't identify.
+    juce_add_gui_app(LC1XQuickLight
+        PRODUCT_NAME    "LC-1X+ Quick Light"
+        COMPANY_NAME    "AMFAS"
+        BUNDLE_ID       "com.amfas.lc1xquicklight"
+        PLIST_TO_MERGE  "<plist><dict><key>LSUIElement</key><true/></dict></plist>"
+    )
+
+    juce_generate_juce_header(LC1XQuickLight)
+
+    target_sources(LC1XQuickLight
+        PRIVATE
+            Source/QuickLight/QuickLightMain.cpp
+            Source/QuickLight/QuickLightEngine.cpp
+            Source/UserProfileStore.cpp
+    )
+
+    target_include_directories(LC1XQuickLight
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source
+            ${CMAKE_CURRENT_SOURCE_DIR}/Source/QuickLight
+    )
+
+    target_compile_features(LC1XQuickLight PRIVATE cxx_std_17)
+
+    target_compile_definitions(LC1XQuickLight
+        PRIVATE
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0
+            JUCE_APPLICATION_NAME_STRING="LC-1X+ Quick Light"
+            JUCE_APPLICATION_VERSION_STRING="${PROJECT_VERSION}"
+    )
+
+    target_link_libraries(LC1XQuickLight
+        PRIVATE
+            juce::juce_audio_devices
+            juce::juce_gui_extra
+        PUBLIC
+            juce::juce_recommended_config_flags
+            juce::juce_recommended_warning_flags
+    )
+
+    # Signing is handled with the plugin bundles at the bottom of this file,
+    # so there's one place that knows about the Developer ID identity.
+endif()
+
 # ---------- Unit tests (optional, headless) ----------
 # Build with:  cmake -B build -DLC1X_BUILD_TESTS=ON  &&  cmake --build build --target LC1XTests
 # Run:         ./build/LC1XTests_artefacts/LC1XTests   (path varies per generator/config)
@@ -119,8 +179,10 @@ set(LC1X_CODESIGN_IDENTITY "" CACHE STRING
 if(APPLE AND LC1X_CODESIGN_IDENTITY)
     set(LC1X_ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/Resources/Entitlements.plist")
 
-    foreach(fmt AU VST3 Standalone)
-        set(_tgt "DMXLightController_${fmt}")
+    # The plugin bundles are named DMXLightController_<FORMAT>; Quick Light is
+    # a plain target, so it's listed by its own name.
+    foreach(_tgt DMXLightController_AU DMXLightController_VST3
+                 DMXLightController_Standalone LC1XQuickLight)
         if(TARGET ${_tgt})
             # Disable Xcode's built-in code signing — we do it explicitly below
             # with the right identity, entitlements, and hardened runtime flags.

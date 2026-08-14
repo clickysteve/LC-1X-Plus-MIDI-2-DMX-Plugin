@@ -103,6 +103,18 @@ void GridComponent::paint(Graphics& g) {
     const auto   floodCol   = unpackFloodColor(proc.floodColor.load());
     const bool   blackout   = proc.blackoutActive.load();
 
+    // The grid shows the SELECTED fixture, so it shows that fixture's fill.
+    // Caller already holds dataLock (see the note at the top of this file).
+    bool     fillOn  = false;
+    RGBColor fillCol {0, 0, 0};
+    {
+        const int fi = proc.activeFixture.load();
+        if (fi >= 0 && fi < (int)proc.fixtures.size()) {
+            fillOn  = proc.fixtures[(size_t)fi].fillActive;
+            fillCol = unpackFloodColor(proc.fixtures[(size_t)fi].fillColor);
+        }
+    }
+
     // Step headers
     for (int s = 0; s < steps; s++) {
         float x   = lw + s * cellW;
@@ -136,6 +148,8 @@ void GridComponent::paint(Graphics& g) {
                 // Flood replaces the colour entirely (hue shift does
                 // nothing to a "user flooded red" command)
                 c = floodCol;
+            } else if (fillOn) {
+                c = fillCol;              // same, scoped to this fixture
             } else if (hueDeg != 0.0f) {
                 c = rotateHue(c, hueDeg);
             }
@@ -394,6 +408,16 @@ void BarPreviewComponent::paint(Graphics& g) {
     const bool   blackout = proc.blackoutActive.load();
     const float  master   = proc.masterDimmer.load();
 
+    bool     fillOn  = false;
+    RGBColor fillCol {0, 0, 0};
+    {
+        const int fi = proc.activeFixture.load();
+        if (fi >= 0 && fi < (int)proc.fixtures.size()) {
+            fillOn  = proc.fixtures[(size_t)fi].fillActive;
+            fillCol = unpackFloodColor(proc.fixtures[(size_t)fi].fillColor);
+        }
+    }
+
     float pad   = 6.0f;
     float segW  = (getWidth() - pad * 2.0f) / segs;
     float y1    = pad, y2 = getHeight() - pad;
@@ -405,6 +429,7 @@ void BarPreviewComponent::paint(Graphics& g) {
 
         if (blackout)            c = {0, 0, 0};
         else if (flood)          c = floodCol;
+        else if (fillOn)         c = fillCol;
         else if (hueDeg != 0.0f) c = rotateHue(c, hueDeg);
 
         // Apply master dimmer so the bar also dims with the slider
@@ -631,7 +656,18 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         bpmSlider.setInterceptsMouseClicks(true, true);
         tapBtn.setEnabled(!external);
         tapBtn.setAlpha(external ? 0.4f : 1.0f);
+        updateHostSyncStatus();
     };
+
+    addAndMakeVisible(hostSyncStatus);
+    hostSyncStatus.setFont(juce::FontOptions(11.0f));
+    hostSyncStatus.setColour(juce::Label::textColourId, Theme::FG_DIM);
+    hostSyncStatus.setTooltip(
+        "What the DAW is actually giving the plugin in Host Sync mode.\n"
+        "'not being processed' means the host never calls the plugin at all —\n"
+        "on Logic, move it to a Software Instrument track's MIDI FX slot.\n"
+        "'no position' means the host runs the plugin but reports no playhead.");
+    updateHostSyncStatus();
 
     // ========== Row 2: MIDI In/Out ==========
     addAndMakeVisible(midiInLabel);
@@ -1130,10 +1166,48 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     floodToggleBtn.onClick = [this] {
         const bool on = floodToggleBtn.getToggleState();
         proc.floodMode.store(on);
-        if (!on) {
+        if (on) {
+            // FLOOD and FILL are both "the next colour click is an override"
+            // modes, so only one can be armed at a time.
+            proc.fillMode.store(false);
+            fillToggleBtn.setToggleState(false, dontSendNotification);
+        } else {
             // Turning flood mode off clears any active flood (via the
             // Flood parameter, so automation lanes see it too)
             proc.setFloodParams(false, -1);
+            grid.repaint();
+            barPreview.repaint();
+        }
+    };
+
+    // FILL toggle — same gesture as FLOOD, but it only touches the fixture
+    // currently selected, and each fixture remembers its own colour. That's
+    // what lets one bar sit on red while another sits on blue.
+    addAndMakeVisible(fillToggleBtn);
+    fillToggleBtn.setClickingTogglesState(true);
+    fillToggleBtn.setTooltip("FILL mode. When ON, clicking a colour button "
+                             "holds THIS fixture on that colour, leaving the "
+                             "others alone — select another fixture and pick a "
+                             "different colour to build up a static look. "
+                             "Click the same colour again to release it. "
+                             "FLOOD overrides every fixture's fill.");
+    fillToggleBtn.setColour(TextButton::buttonOnColourId, Colour(0xff0070c0));
+    fillToggleBtn.setToggleState(proc.fillMode.load(), dontSendNotification);
+    fillToggleBtn.onClick = [this] {
+        const bool on = fillToggleBtn.getToggleState();
+        proc.fillMode.store(on);
+        if (on) {
+            proc.floodMode.store(false);
+            floodToggleBtn.setToggleState(false, dontSendNotification);
+            // Also release any flood that's currently up. Untickling the
+            // button with dontSendNotification skips FLOOD's own off
+            // handler, and a live flood would otherwise keep overriding
+            // every fill click — looking like FILL simply didn't work.
+            proc.setFloodParams(false, -1);
+        } else {
+            // Leaving fill mode releases every fixture's fill, so the mode
+            // toggle is always a clean way back to the pattern.
+            proc.clearAllFills();
             grid.repaint();
             barPreview.repaint();
         }
@@ -1434,7 +1508,12 @@ void DMXControllerEditor::resized() {
         clockSrcSelector.setBounds(row.removeFromLeft(120));
 
         panicBtn   .setBounds(row.removeFromRight(68));  row.removeFromRight(gap);
-        blackoutBtn.setBounds(row.removeFromRight(100));
+        blackoutBtn.setBounds(row.removeFromRight(100)); row.removeFromRight(gap);
+
+        // Whatever is left of the transport row belongs to the Host Sync
+        // readout, which is only visible in that mode.
+        row.removeFromLeft(8);
+        hostSyncStatus.setBounds(row);
     }
     area.removeFromTop(gap);
 
@@ -1480,8 +1559,10 @@ void DMXControllerEditor::resized() {
     {
         auto row = area.removeFromTop(rowH);
 
-        // FLOOD toggle on the far left — positioned above Copy in Row 5
+        // Live-override modes on the far left — positioned above Copy in Row 5
         floodToggleBtn.setBounds(row.removeFromLeft(60));
+        row.removeFromLeft(4);
+        fillToggleBtn .setBounds(row.removeFromLeft(52));
         row.removeFromLeft(10);
 
         int btnW = 28;
@@ -1493,7 +1574,7 @@ void DMXControllerEditor::resized() {
         brightnessLabel .setBounds(row.removeFromLeft(44));
         brightnessSlider.setBounds(row.removeFromLeft(110));
         row.removeFromLeft(10);
-        fillBtn .setBounds(row.removeFromLeft(44)); row.removeFromLeft(gap);
+        fillBtn .setBounds(row.removeFromLeft(64)); row.removeFromLeft(gap);
         clearBtn.setBounds(row.removeFromLeft(50)); row.removeFromLeft(gap);
         eraseBtn.setBounds(row.removeFromLeft(54)); row.removeFromLeft(gap);
         genBtn  .setBounds(row.removeFromLeft(80)); row.removeFromLeft(10);
@@ -1629,6 +1710,12 @@ void DMXControllerEditor::timerCallback() {
     // point of edit, so nothing is missed — this just stops the plugin
     // burning CPU redrawing an identical frame 30 times a second.
     {
+        // Reads fixtures and the current pattern index, both of which a
+        // scene load or setStateInformation can replace wholesale from
+        // another thread — so this needs the same lock the paint methods
+        // take (see the note at the top of this file).
+        const juce::ScopedLock l(proc.dataLock);
+
         VisualState now;
         now.step      = proc.currentStep.load();
         now.hue       = proc.hueShiftDeg.load();
@@ -1637,6 +1724,10 @@ void DMXControllerEditor::timerCallback() {
         now.flood     = proc.floodActive.load();
         now.floodCol  = proc.floodColor.load();
         now.fixture   = proc.activeFixture.load();
+        if (now.fixture >= 0 && now.fixture < (int)proc.fixtures.size()) {
+            now.fill    = proc.fixtures[(size_t)now.fixture].fillActive;
+            now.fillCol = proc.fixtures[(size_t)now.fixture].fillColor;
+        }
         now.patternId = proc.currentBank().currentIndex;
         now.songBlock = proc.songModeActive ? proc.songPlayer.currentBlock : -1;
 
@@ -1691,6 +1782,8 @@ void DMXControllerEditor::timerCallback() {
     // (blackoutBtn is driven by its parameter attachment now)
     midiLearnBtn.setToggleState(proc.midiLearnActive.load(), dontSendNotification);
 
+    updateHostSyncStatus();
+
     // Mirror a MIDI-mapped Brightness CC into the slider + grid. The
     // slider's onValueChange writes the same value back to brightnessLive,
     // so this converges instead of looping.
@@ -1717,19 +1810,33 @@ void DMXControllerEditor::timerCallback() {
             autoResetSelector.setSelectedId(wantId, dontSendNotification);
     }
     floodToggleBtn.setToggleState(proc.floodMode.load(), dontSendNotification);
+    fillToggleBtn .setToggleState(proc.fillMode.load(),  dontSendNotification);
 
     for (int i = 0; i < 4; i++) {
         sceneBtns[i].setColour(TextButton::buttonColourId,
             proc.scenes[i].occupied ? Theme::ACCENT.darker(0.5f) : Theme::BG_TERTIARY);
     }
 
-    // Highlight the colour button that matches an active flood (if any)
+    // Highlight the colour button matching an active override: the flood if
+    // one is up, otherwise the selected fixture's fill. Both use the same
+    // colour buttons, so only one highlight can be meaningful at a time and
+    // flood — being the rig-wide one — wins.
     {
-        const bool floodOn = proc.floodActive.load();
-        const uint32_t cur = proc.floodColor.load();
+        const bool     floodOn = proc.floodActive.load();
+        uint32_t       cur     = proc.floodColor.load();
+        bool           anyOn   = floodOn;
+        if (!floodOn) {
+            const juce::ScopedLock l(proc.dataLock);
+            const int fi = proc.activeFixture.load();
+            if (fi >= 0 && fi < (int)proc.fixtures.size()
+                && proc.fixtures[(size_t)fi].fillActive) {
+                anyOn = true;
+                cur   = proc.fixtures[(size_t)fi].fillColor;
+            }
+        }
         for (int i = 0; i < kNumColorBtns; i++) {
             auto pc = PRESET_COLORS[i];
-            const bool match = floodOn && packFloodColor(pc) == cur;
+            const bool match = anyOn && packFloodColor(pc) == cur;
             colorBtns[i].setColour(TextButton::buttonColourId,
                 match ? Colour(pc.r, pc.g, pc.b).brighter(0.4f)
                       : Colour(pc.r, pc.g, pc.b));
@@ -1749,6 +1856,56 @@ void DMXControllerEditor::timerCallback() {
 // ============================================================================
 // Helpers
 // ============================================================================
+// ============================================================================
+// Host Sync status readout
+//
+// Host Sync is the only clock that can fail silently through no fault of the
+// plugin: it needs the host to render us AND to report a playhead position.
+// Logic, for one, does not render a MIDI FX plugin on every kind of track.
+// Rather than leave that looking like a bug, say plainly which piece is
+// missing and what state the sync is in.
+// ============================================================================
+void DMXControllerEditor::updateHostSyncStatus() {
+    if (proc.clockSource.load() != 2) {
+        if (hostSyncStatus.isVisible()) hostSyncStatus.setVisible(false);
+        lastHostSyncStatus_.clear();
+        return;
+    }
+    hostSyncStatus.setVisible(true);
+
+    juce::String   text;
+    juce::Colour   colour = Theme::FG_DIM;
+
+    if (proc.hostDiagBlocks.load() == 0) {
+        text   = "host is not processing this plugin";
+        colour = Theme::RED_ACCENT;
+    } else if (!proc.hostDiagHavePlayhead.load()) {
+        text   = "host reports no playhead";
+        colour = Theme::RED_ACCENT;
+    } else if (!proc.hostDiagHavePpq.load()) {
+        text   = "host reports no position";
+        colour = Theme::RED_ACCENT;
+    } else {
+        const double ppq  = proc.hostDiagPpq.load();
+        const bool   play = proc.hostDiagPlaying.load();
+        // PPQ is quarter-notes from the start of the timeline; showing it as
+        // bar.beat in 4/4 is what you can actually check against the ruler.
+        const juce::int64 beat = (juce::int64)std::floor(ppq);
+        text  = juce::String(play ? "PLAY " : "STOP ")
+              + juce::String(beat / 4 + 1) + "." + juce::String(beat % 4 + 1);
+        text += " @ " + juce::String(proc.hostBpm.load(), 1) + " BPM";
+        if (proc.hostDiagPpqDerived.load())   text += " (derived)";
+        if (proc.hostDiagPlayInferred.load()) text += " (inferred)";
+        colour = play ? Theme::GREEN_ACCENT : Theme::FG_DIM;
+    }
+
+    if (text != lastHostSyncStatus_) {
+        lastHostSyncStatus_ = text;
+        hostSyncStatus.setText(text, juce::dontSendNotification);
+        hostSyncStatus.setColour(juce::Label::textColourId, colour);
+    }
+}
+
 void DMXControllerEditor::refreshPatternSelector() {
     patternSelector.clear(dontSendNotification);
     auto& bank = proc.currentBank();
@@ -1839,6 +1996,28 @@ void DMXControllerEditor::selectColor(int idx) {
                 proc.setFloodParams(false, -1);
             else
                 proc.setFloodParams(true, idx);
+        }
+        grid.repaint();
+        barPreview.repaint();
+        return;
+    }
+
+    // FILL mode: same gesture, but scoped to the selected fixture only.
+    if (proc.fillMode.load()) {
+        const bool isEraseColor = (idx == NUM_PRESET_COLORS - 1);
+        if (isEraseColor) {
+            proc.setFillForActiveFixture(false, 0);
+        } else {
+            const uint32_t packed = packFloodColor(PRESET_COLORS[idx]);
+            bool releasing = false;
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                const int fi = proc.activeFixture.load();
+                if (fi >= 0 && fi < (int)proc.fixtures.size())
+                    releasing = proc.fixtures[(size_t)fi].fillActive
+                             && proc.fixtures[(size_t)fi].fillColor == packed;
+            }
+            proc.setFillForActiveFixture(!releasing, packed);
         }
         grid.repaint();
         barPreview.repaint();
