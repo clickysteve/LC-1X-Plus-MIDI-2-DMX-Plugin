@@ -93,6 +93,21 @@ public:
     // reflect the host's tempo while MIDI clock mode is active.
     std::atomic<double> hostBpm {120.0};
 
+    // ==== MIDI to host ====
+    // Whether the DMX note stream is also written to the plugin's own MIDI
+    // output, i.e. passed down the host's chain.
+    //
+    // Off by default, because of how Logic works. A MIDI FX plugin is only
+    // processed on a track the host actually renders, which in Logic means a
+    // Software Instrument track with an instrument loaded — and that
+    // instrument would then receive up to 128 DMX notes at once and make an
+    // appalling noise. The rig is driven by the direct MIDI output device, so
+    // the host stream isn't needed for it to work.
+    //
+    // Turn it on in hosts where a MIDI effect's output can be routed to a
+    // MIDI port (Ableton, Bitwig, Reaper), which is the case it exists for.
+    std::atomic<bool> sendMidiToHost {false};
+
     // ==== Host Sync diagnostics ====
     // Host Sync is the one clock that depends entirely on the host: it needs
     // processBlock to be called AND the host to report a transport position.

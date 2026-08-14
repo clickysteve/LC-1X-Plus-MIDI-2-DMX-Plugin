@@ -41,6 +41,27 @@ a MIDI FX plugin needs to be on a track the host actually renders; if the
 readout says the plugin isn't being processed, move it to a Software
 Instrument track's MIDI FX slot.
 
+## New: MIDI to Host toggle (and why Host Sync needs it)
+
+Logic only runs a MIDI FX plugin on a track it actually renders, which means
+a Software Instrument track **with an instrument loaded**. An empty one is
+never processed at all, which is the single most likely reason Host Sync
+appears dead — the new readout says so explicitly.
+
+But loading an instrument used to have an unpleasant side effect: the plugin
+replaces the track's MIDI output with the DMX note stream, so the instrument
+received up to 128 notes at once and made a racket.
+
+There's now a **To host** toggle next to the MIDI Out selector, **off by
+default**. With it off the DMX stream goes only to the MIDI output device,
+which is what drives your rig anyway, and the instrument sitting after the
+plugin hears nothing. Turn it on in hosts where a MIDI effect's output can be
+routed to a MIDI port — Ableton, Bitwig, Reaper — which is the case the
+feature exists for. It's saved with the project.
+
+If you're on Logic: load any instrument, leave **To host** off, and set Clock
+to Host Sync.
+
 ## New: FILL — per-fixture colour override
 
 FLOOD lights the whole rig one colour. **FILL** does the same thing to one
@@ -88,7 +109,7 @@ It's installed to `/Applications` by the installer alongside the standalone.
 
 ## Tests
 
-The suite grew from 41 cases to 56. New coverage: Host Sync against hosts
+The suite grew from 41 cases to 57. New coverage: Host Sync against hosts
 that report no musical position, no transport state, a free-running engine
 clock, and a zero-length audio buffer; the diagnostics themselves; and
 FILL's interaction with FLOOD, BLACKOUT, a stopped transport, multiple

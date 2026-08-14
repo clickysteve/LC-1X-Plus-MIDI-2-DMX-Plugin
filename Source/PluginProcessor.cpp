@@ -1127,6 +1127,13 @@ void DMXControllerProcessor::emitDmxDelta(juce::MidiBuffer* buf, int sampleOffse
     if (outputDesynced_.exchange(false))
         std::memset(prevDmxState_, -1, sizeof(prevDmxState_));
 
+    // hostMidiOut_ is only non-null while processBlock runs, and only
+    // honoured when the user has asked for the stream to go down the host's
+    // chain — see sendMidiToHost for why that's off by default. Resolved once
+    // here rather than per channel: this loop runs up to 128 times.
+    juce::MidiBuffer* const hostOut =
+        sendMidiToHost.load() ? hostMidiOut_ : nullptr;
+
     for (int ch = 0; ch < 128; ch++) {
         const int vel = dmxToVelocity(dmxState_[ch]);
         if (vel == prevDmxState_[ch])
@@ -1138,14 +1145,10 @@ void DMXControllerProcessor::emitDmxDelta(juce::MidiBuffer* buf, int sampleOffse
         const juce::uint8 d1     = (juce::uint8)ch;
         const juce::uint8 d2     = (juce::uint8)(vel > 0 ? vel : 0);
 
-        if (buf || hostMidiOut_) {
+        if (buf || hostOut) {
             const juce::MidiMessage m(status, d1, d2);
             if (buf) buf->addEvent(m, sampleOffset);
-            // While processBlock is running (hostMidiOut_ set under
-            // dataLock, which every caller of emitDmxDelta holds), also
-            // feed the host's MIDI output so DAW-side routing receives the
-            // DMX stream.
-            if (hostMidiOut_) hostMidiOut_->addEvent(m, hostSamplePos_);
+            if (hostOut) hostOut->addEvent(m, hostSamplePos_);
         }
 
         if (midiSender_ && !midiSender_->push(status, d1, d2)) {
@@ -1279,6 +1282,7 @@ void DMXControllerProcessor::writeState(juce::MemoryBlock& dest, bool includeSce
     xml->setAttribute("autoResetMode", (int)autoResetMode.load());
     xml->setAttribute("floodMode",       (bool)floodMode.load());
     xml->setAttribute("fillMode",        (bool)fillMode.load());
+    xml->setAttribute("midiToHost",      (bool)sendMidiToHost.load());
 
     // Host-automatable parameters. The scalar attributes above are still
     // written so files stay readable by older plugin versions, but PARAMS
@@ -1385,6 +1389,7 @@ void DMXControllerProcessor::setStateInformation(const void* data, int sizeInByt
     // up leaves the FILL button armed and the colour buttons still able to
     // release them. Without this the fills come back lit but unreachable.
     fillMode.store(xml->getBoolAttribute("fillMode", false));
+    sendMidiToHost.store(xml->getBoolAttribute("midiToHost", false));
     // (floodActive/floodColor are parameters now and restore with PARAMS
     // below, like any other automatable value.)
     savedOut = xml->getStringAttribute("midiOutDevice");

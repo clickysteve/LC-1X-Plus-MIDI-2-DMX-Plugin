@@ -116,6 +116,8 @@ private:
     juce::Label      midiOutLabel{"", "MIDI Out:"};
     juce::ComboBox   midiOutSelector;
     juce::TextButton midiOutRefreshBtn{juce::CharPointer_UTF8("\xe2\x86\xbb")};  // ↻
+    // Whether the DMX stream also goes down the host's own MIDI chain.
+    juce::ToggleButton midiToHostBtn{"To host"};
 
     juce::Label      fixtureLabel{"", "Fixture:"};
     juce::ComboBox   fixtureSelector;

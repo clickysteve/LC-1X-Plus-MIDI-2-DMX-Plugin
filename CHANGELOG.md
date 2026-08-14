@@ -22,6 +22,12 @@ scheduling no longer depends on the audio buffer's shape. A readout in the
 transport row now shows what the DAW is actually providing, including the
 case the plugin can't fix — the host not rendering it at all.
 
+**Added: To host toggle.** Logic only runs a MIDI FX plugin on a track it
+renders, i.e. a Software Instrument track with an instrument loaded — and that
+instrument used to receive the DMX note stream and make a racket. The stream
+now only goes down the host's chain when asked, off by default. Turn it on in
+hosts where a MIDI effect's output can be routed to a MIDI port.
+
 **Added: FILL.** FLOOD lights the whole rig one colour; FILL does the same
 to one fixture, and each fixture keeps its own, so several colours can be
 held across the rig at once. UI and MIDI Learn driven, saved with the
@@ -32,7 +38,7 @@ editing button previously called Fill is now Fill Grid.
 without opening a DAW. Colour, brightness, MIDI output and a rig setup
 window; shares the plugin's fixture profiles; blacks out on quit.
 
-**Tests** — 41 cases to 56. The Host Sync regression tests fail against
+**Tests** — 41 cases to 57. The Host Sync regression tests fail against
 1.2.1 and pass here, including one that guards against treating the audio
 engine's free-running sample clock as a timeline position.
 

@@ -692,6 +692,27 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     };
     midiOutRefreshBtn.onClick = [this] { refreshMidiDeviceList(); };
 
+    // "To host": send the DMX note stream down the host's MIDI chain as well
+    // as to the device. Off by default — in Logic the plugin has to sit on a
+    // Software Instrument track with an instrument loaded (that's the only
+    // way Logic runs it at all), and that instrument would otherwise receive
+    // 128 DMX notes at once.
+    addAndMakeVisible(midiToHostBtn);
+    midiToHostBtn.setClickingTogglesState(true);
+    midiToHostBtn.setToggleState(proc.sendMidiToHost.load(), dontSendNotification);
+    midiToHostBtn.setTooltip(
+        "Also send the DMX note stream to the plugin's own MIDI output, "
+        "down the host's chain.\n\n"
+        "Leave this OFF in Logic: the plugin only runs on a Software "
+        "Instrument track with an instrument loaded, and the instrument "
+        "would receive the DMX notes and make a racket. Your rig is driven "
+        "by the MIDI Out device above either way.\n\n"
+        "Turn it ON in hosts where a MIDI effect's output can be routed to a "
+        "MIDI port (Ableton, Bitwig, Reaper).");
+    midiToHostBtn.onClick = [this] {
+        proc.sendMidiToHost.store(midiToHostBtn.getToggleState());
+    };
+
     addAndMakeVisible(fixtureLabel);
     addAndMakeVisible(fixtureSelector);
     addAndMakeVisible(addFixBtn);
@@ -1525,7 +1546,8 @@ void DMXControllerEditor::resized() {
 
         midiOutLabel     .setBounds(row.removeFromLeft(60));
         midiOutSelector  .setBounds(row.removeFromLeft(200)); row.removeFromLeft(gap);
-        midiOutRefreshBtn.setBounds(row.removeFromLeft(26));
+        midiOutRefreshBtn.setBounds(row.removeFromLeft(26)); row.removeFromLeft(gap);
+        midiToHostBtn    .setBounds(row.removeFromLeft(90));
     }
     area.removeFromTop(gap);
 

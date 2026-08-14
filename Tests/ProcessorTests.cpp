@@ -72,8 +72,14 @@ static std::vector<Ev> collect(const juce::MidiBuffer& buf, int baseSample = 0) 
 }
 
 // Run one processBlock with the given MIDI input; returns emitted events.
+//
+// The host MIDI buffer is how these tests observe what the engine produced,
+// so this opts into it. It is OFF in the shipping default (see
+// sendMidiToHost) — the test below covers that behaviour specifically, and
+// drives processBlock directly so it isn't affected by this.
 static std::vector<Ev> runBlock(DMXControllerProcessor& p, juce::MidiBuffer midiIn,
                                 int numSamples = 512, int baseSample = 0) {
+    p.sendMidiToHost.store(true);
     juce::AudioBuffer<float> audio(2, numSamples);
     p.processBlock(audio, midiIn);
     return collect(midiIn, baseSample);
@@ -308,6 +314,33 @@ public:
             expectEquals(proc.currentStep.load(), 15);   // parked at last step
         }
 
+        beginTest("MIDI to host is off by default and gates the host stream");
+        {
+            // Off by default because in Logic the plugin can only run on a
+            // Software Instrument track with an instrument loaded, and that
+            // instrument would receive every DMX note.
+            DMXControllerProcessor p2;
+            p2.prepareToPlay(44100.0, 512);
+            p2.clockSource.store(1);
+            {
+                const juce::ScopedLock l(p2.dataLock);
+                p2.fixtures[0].patternBank.patterns[0] = Pattern::chase(16, 8, {255, 0, 0});
+            }
+            expect(!p2.sendMidiToHost.load(), "off by default");
+
+            // Deliberately not via runBlock(), which opts in.
+            juce::AudioBuffer<float> audio(2, 512);
+            juce::MidiBuffer m1 = clockTicks(kClocksPerStep, true);
+            p2.processBlock(audio, m1);
+            expectEquals((int)collect(m1).size(), 0,
+                         "nothing reaches the host chain");
+
+            p2.sendMidiToHost.store(true);
+            juce::MidiBuffer m2 = clockTicks(kClocksPerStep);
+            p2.processBlock(audio, m2);
+            expect(collect(m2).size() > 0, "enabling it puts the stream back");
+        }
+
         beginTest("clocks are ignored while stopped");
         {
             auto evs = runBlock(proc, clockTicks(kClocksPerStep));
@@ -539,6 +572,7 @@ public:
             proc.clockSource.store(2);
             setChasePattern(proc);
             ph.playing = true;
+            proc.sendMidiToHost.store(true);   // observe via the host buffer
 
             const double ppqPerSample = ph.bpm / 60.0 / 44100.0;
             int noteOns = 0;

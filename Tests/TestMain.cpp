@@ -8,6 +8,7 @@
 #include <JuceHeader.h>
 #include "AllocCounter.h"
 #include <cstdlib>
+#include <thread>
 
 // ----------------------------------------------------------------------------
 // Global allocation counter, used by the realtime-safety tests to prove that
@@ -16,10 +17,19 @@
 // an explicitly scoped measurement, so the cost elsewhere is one relaxed
 // atomic increment per allocation.
 // ----------------------------------------------------------------------------
-namespace lc1x { std::atomic<int> allocCount { 0 }; }
+namespace lc1x {
+    std::atomic<int> allocCount { 0 };
+    std::atomic<std::thread::id> countedThread {};
+}
 
 void* operator new(std::size_t n) {
-    lc1x::allocCount.fetch_add(1, std::memory_order_relaxed);
+    // Count only the thread under measurement. Other threads allocate
+    // concurrently and would otherwise show up as phantom allocations on the
+    // audio path — see the note in AllocCounter.h.
+    if (std::this_thread::get_id()
+        == lc1x::countedThread.load(std::memory_order_relaxed))
+        lc1x::allocCount.fetch_add(1, std::memory_order_relaxed);
+
     if (void* p = std::malloc(n == 0 ? 1 : n)) return p;
     throw std::bad_alloc();
 }
@@ -31,6 +41,10 @@ void  operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 int main()
 {
+    // Every UnitTest runs on this thread, so this is the thread whose
+    // allocations the realtime-safety tests are measuring.
+    lc1x::countedThread.store(std::this_thread::get_id());
+
     // Message manager + platform init (no windows are ever created).
     juce::ScopedJuceInitialiser_GUI juceInit;
 
