@@ -175,6 +175,19 @@ private:
 };
 
 // ----------------------------------------------------------------------------
+// macOS dispatches a status-item menu's selections through JUCE's main-menu
+// handler, and that handler drops every selection on the floor unless a
+// MenuBarModel has been set (JuceMainMenuHandler::invoke() is guarded on it).
+// An agent app has no visible menu bar, so this model is empty; it exists
+// purely so that clicking a menu item actually does something.
+// ----------------------------------------------------------------------------
+struct EmptyMenuBarModel final : juce::MenuBarModel {
+    juce::StringArray getMenuBarNames() override { return {}; }
+    juce::PopupMenu   getMenuForIndex(int, const juce::String&) override { return {}; }
+    void              menuItemSelected(int, int) override {}
+};
+
+// ----------------------------------------------------------------------------
 // The menu bar icon itself.
 // ----------------------------------------------------------------------------
 class QuickLightTrayIcon : public juce::SystemTrayIconComponent {
@@ -207,59 +220,17 @@ public:
         setIconImage(img, img);
     }
 
+    // Reachable by the menu action lambdas, which go through the instance.
+    QuickLightEngine& engine_;
+
 private:
-    void showMenu() {
-        juce::PopupMenu menu;
-
-        const bool on = engine_.isOn();
-        menu.addItem(kMenuOffBase, on ? "Turn lights off" : "Turn lights on", true, false);
-        menu.addSeparator();
-
-        // Colours. The palette is the plugin's, minus its "black = off" tile,
-        // which the item above already covers.
-        juce::PopupMenu colours;
-        const auto cur = engine_.getColour();
-        for (int i = 0; i < NUM_PRESET_COLORS - 1; ++i) {
-            const auto pc = PRESET_COLORS[i];
-            const bool ticked = on && pc.r == cur.r && pc.g == cur.g && pc.b == cur.b;
-            juce::PopupMenu::Item item(colourName(i));
-            item.itemID     = kMenuColourBase + i;
-            item.isTicked   = ticked;
-            item.colour     = juce::Colour((juce::uint8)pc.r, (juce::uint8)pc.g,
-                                           (juce::uint8)pc.b);
-            colours.addItem(item);
-        }
-        menu.addSubMenu("Colour", colours);
-
-        juce::PopupMenu bright;
-        for (int pct = 25; pct <= 100; pct += 25) {
-            const bool ticked =
-                std::abs(engine_.getBrightness() - pct / 100.0f) < 0.01f;
-            bright.addItem(kMenuBrightnessBase + pct / 25,
-                           juce::String(pct) + "%", true, ticked);
-        }
-        menu.addSubMenu("Brightness", bright);
-
-        menu.addSeparator();
-
-        juce::PopupMenu devices;
-        const auto names = engine_.getOutputDeviceNames();
-        if (names.isEmpty()) {
-            devices.addItem(-1, "No MIDI outputs found", false, false);
-        } else {
-            for (int i = 0; i < names.size(); ++i)
-                devices.addItem(kMenuDeviceBase + i, names[i], true,
-                                names[i] == engine_.getCurrentDeviceName());
-        }
-        menu.addSubMenu("MIDI output", devices);
-        menu.addItem(kMenuSetupRig, "Set up rig...");
-
-        menu.addSeparator();
-        menu.addItem(kMenuQuit, "Quit");
-
-        menu.showMenuAsync(juce::PopupMenu::Options(),
-                           [this](int result) { handleResult(result); });
-    }
+    // Every item carries its own action rather than an id resolved by a
+    // result callback. That's required by the macOS path below — the native
+    // status-item menu reports selections through the item's action, not
+    // through a PopupMenu result — and both menu implementations honour it,
+    // so there's one code path instead of two.
+    // Defined below QuickLightApplication, which it needs to reach.
+    void showMenu();
 
     static juce::String colourName(int i) {
         static const char* names[] = { "Red", "Orange", "Yellow", "Green",
@@ -267,9 +238,6 @@ private:
         return (i >= 0 && i < 9) ? names[i] : "Colour";
     }
 
-    void handleResult(int result);
-
-    QuickLightEngine& engine_;
 };
 
 } // namespace
@@ -282,6 +250,10 @@ public:
     bool moreThanOneInstanceAllowed() override          { return false; }
 
     void initialise(const juce::String&) override {
+       #if JUCE_MAC
+        // Must come before the tray icon: see EmptyMenuBarModel.
+        juce::MenuBarModel::setMacMainMenu(&menuModel_);
+       #endif
         engine_ = std::make_unique<QuickLightEngine>();
         tray_   = std::make_unique<QuickLightTrayIcon>(*engine_);
     }
@@ -295,6 +267,9 @@ public:
         rigWindow_.reset();
         tray_.reset();
         engine_.reset();
+       #if JUCE_MAC
+        juce::MenuBarModel::setMacMainMenu(nullptr);
+       #endif
     }
 
     void systemRequestedQuit() override { quit(); }
@@ -334,37 +309,97 @@ public:
     void closeRigSetup() { rigWindow_.reset(); }
 
 private:
+    EmptyMenuBarModel                   menuModel_;
     std::unique_ptr<QuickLightEngine>   engine_;
     std::unique_ptr<QuickLightTrayIcon> tray_;
     std::unique_ptr<juce::DocumentWindow> rigWindow_;
 };
 
-// Defined after the application class so it can reach it.
-void QuickLightTrayIcon::handleResult(int result) {
-    if (result <= 0) return;
+// Defined out of line: it reaches QuickLightApplication, declared above.
+void QuickLightTrayIcon::showMenu() {
+    juce::PopupMenu menu;
+    juce::Component::SafePointer<QuickLightTrayIcon> safeThis(this);
 
-    if (result == kMenuQuit) {
-        juce::JUCEApplication::getInstance()->systemRequestedQuit();
-        return;
+    // The action is invoked asynchronously, so it must not assume the
+    // icon still exists: quitting from the menu destroys it.
+    auto act = [safeThis](std::function<void(QuickLightTrayIcon&)> fn) {
+        return [safeThis, fn] {
+            if (auto* self = safeThis.getComponent()) {
+                fn(*self);
+                self->refreshIcon();
+            }
+        };
+    };
+
+    const bool on = engine_.isOn();
+    menu.addItem(on ? "Turn lights off" : "Turn lights on",
+                 act([](QuickLightTrayIcon& s) { s.engine_.setOn(!s.engine_.isOn()); }));
+    menu.addSeparator();
+
+    // Colours. The palette is the plugin's, minus its "black = off" tile,
+    // which the item above already covers.
+    juce::PopupMenu colours;
+    const auto cur = engine_.getColour();
+    for (int i = 0; i < NUM_PRESET_COLORS - 1; ++i) {
+        const auto pc = PRESET_COLORS[i];
+        juce::PopupMenu::Item item(colourName(i));
+        item.itemID   = kMenuColourBase + i;   // native menus need a non-zero id
+        item.isTicked = on && pc.r == cur.r && pc.g == cur.g && pc.b == cur.b;
+        item.colour   = juce::Colour((juce::uint8)pc.r, (juce::uint8)pc.g,
+                                     (juce::uint8)pc.b);
+        item.action   = act([pc](QuickLightTrayIcon& s) { s.engine_.setColour(pc); });
+        colours.addItem(item);
     }
-    if (result == kMenuSetupRig) {
+    menu.addSubMenu("Colour", colours);
+
+    juce::PopupMenu bright;
+    for (int pct = 25; pct <= 100; pct += 25) {
+        const float level = pct / 100.0f;
+        juce::PopupMenu::Item item(juce::String(pct) + "%");
+        item.itemID   = kMenuBrightnessBase + pct / 25;
+        item.isTicked = std::abs(engine_.getBrightness() - level) < 0.01f;
+        item.action   = act([level](QuickLightTrayIcon& s) { s.engine_.setBrightness(level); });
+        bright.addItem(item);
+    }
+    menu.addSubMenu("Brightness", bright);
+
+    menu.addSeparator();
+
+    juce::PopupMenu devices;
+    const auto names = engine_.getOutputDeviceNames();
+    if (names.isEmpty()) {
+        devices.addItem(-1, "No MIDI outputs found", false, false);
+    } else {
+        for (int i = 0; i < names.size(); ++i) {
+            const auto name = names[i];
+            juce::PopupMenu::Item item(name);
+            item.itemID   = kMenuDeviceBase + i;
+            item.isTicked = (name == engine_.getCurrentDeviceName());
+            item.action   = act([name](QuickLightTrayIcon& s) {
+                                    s.engine_.setOutputDevice(name); });
+            devices.addItem(item);
+        }
+    }
+    menu.addSubMenu("MIDI output", devices);
+
+    menu.addItem("Set up rig...", [] {
         QuickLightApplication::get().showRigSetup();
-        return;
-    }
-    if (result == kMenuOffBase) {
-        engine_.setOn(!engine_.isOn());
-    } else if (result >= kMenuColourBase && result < kMenuColourBase + NUM_PRESET_COLORS) {
-        engine_.setColour(PRESET_COLORS[result - kMenuColourBase]);
-    } else if (result >= kMenuBrightnessBase && result < kMenuBrightnessBase + 10) {
-        engine_.setBrightness((result - kMenuBrightnessBase) * 25 / 100.0f);
-    } else if (result >= kMenuDeviceBase) {
-        const auto names = engine_.getOutputDeviceNames();
-        const int idx = result - kMenuDeviceBase;
-        if (idx >= 0 && idx < names.size())
-            engine_.setOutputDevice(names[idx]);
-    }
+    });
 
-    refreshIcon();
+    menu.addSeparator();
+    menu.addItem("Quit", [] {
+        juce::JUCEApplication::getInstance()->systemRequestedQuit();
+    });
+
+   #if JUCE_MAC
+    // A status-bar menu has to be the NSStatusItem's own menu. Showing a
+    // JUCE PopupMenu from the tray icon's mouseDown puts up a window that
+    // the status item's own event handling dismisses on the very next
+    // event, so the menu flashes and vanishes.
+    showDropdownMenu(menu);
+   #else
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this));
+   #endif
 }
 
 START_JUCE_APPLICATION(QuickLightApplication)
