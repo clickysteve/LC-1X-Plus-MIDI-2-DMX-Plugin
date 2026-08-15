@@ -282,21 +282,29 @@ public:
     QuickLightTrayIcon* tray()          { return tray_.get(); }
 
     void showRigSetup() {
+        // An agent app (LSUIElement) is never the foreground application, so
+        // a window it opens goes up behind whatever you were using — or on
+        // some setups doesn't appear to open at all. toFront() alone isn't
+        // enough; the process itself has to be brought forward first.
+        juce::Process::makeForegroundProcess();
+
         if (rigWindow_ != nullptr) {
+            rigWindow_->setVisible(true);
             rigWindow_->toFront(true);
             return;
         }
+
         class Window : public juce::DocumentWindow {
         public:
             Window(QuickLightEngine& e)
-                : DocumentWindow("Quick Light — Rig", juce::Colours::darkgrey,
+                : DocumentWindow("Quick Light - Rig", juce::Colours::darkgrey,
                                  DocumentWindow::closeButton) {
                 setUsingNativeTitleBar(true);
                 setContentOwned(new RigSetupComponent(e), true);
-                centreWithSize(getWidth(), getHeight());
+                setResizable(true, false);      // a long rig needs the room
+                centreWithSize(juce::jmax(560, getWidth()),
+                               juce::jmax(320, getHeight()));
                 setVisible(true);
-                // A menu bar app has no Dock icon, so the setup window has to
-                // pull itself to the front or it opens behind everything.
                 toFront(true);
             }
             void closeButtonPressed() override {
@@ -306,7 +314,16 @@ public:
         rigWindow_ = std::make_unique<Window>(*engine_);
     }
 
-    void closeRigSetup() { rigWindow_.reset(); }
+    void closeRigSetup() {
+        // Deleting the window from inside its own closeButtonPressed would
+        // destroy the object we are currently executing a method of.
+        juce::MessageManager::callAsync([this] {
+            rigWindow_.reset();
+            // Nothing left on screen, so hand the foreground back rather
+            // than leaving a menu bar app sitting in front of everything.
+            juce::Process::hide();
+        });
+    }
 
 private:
     EmptyMenuBarModel                   menuModel_;
