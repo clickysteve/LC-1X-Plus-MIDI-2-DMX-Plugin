@@ -257,6 +257,18 @@ void DMXControllerProcessor::forceRecompute() {
 }
 
 // ============================================================================
+// The processor gets constructed as a local in the tests, and some host
+// scanning tools do the same, so it has to stay small enough to sit on a
+// stack. A megabyte-wide capture buffer inside ShowRecorder once made this
+// object big enough to blow the stack the moment a test declared one — the
+// crash landed in an unrelated test, which made it a thoroughly misleading
+// hunt. Keep large buffers on the heap.
+// ============================================================================
+static_assert(sizeof(DMXControllerProcessor) < 256 * 1024,
+              "DMXControllerProcessor has grown too large to place on a stack "
+              "- move whatever was just added to the heap");
+
+// ============================================================================
 // Live capture
 // ============================================================================
 double DMXControllerProcessor::captureTimestamp(int sampleOffset) noexcept {

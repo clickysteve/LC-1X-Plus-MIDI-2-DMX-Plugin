@@ -1,6 +1,10 @@
 #include "ShowRecorder.h"
 
 ShowRecorder::ShowRecorder() {
+    // The FIFO storage is allocated once, here, and never grows — push() on
+    // the audio thread only ever indexes into it.
+    slots_.resize((size_t)kCapacity);
+
     // Reserve up front so the first drain of a take doesn't allocate at a
     // moment when the user is mid-performance.
     events_.reserve(1 << 14);

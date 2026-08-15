@@ -1,7 +1,6 @@
 #pragma once
 
 #include <JuceHeader.h>
-#include <array>
 #include <atomic>
 #include <vector>
 
@@ -86,6 +85,12 @@ private:
     // second that's over four minutes of buffer, against a drain that runs
     // ten times a second — the headroom is there so a stalled message thread
     // can't cost you a take.
+    //
+    // At 16 bytes an event that's a megabyte, which must NOT be an inline
+    // array: DMXControllerProcessor embeds a ShowRecorder by value, and a
+    // megabyte-wide processor overflows the stack the moment anything
+    // constructs one as a local — which the tests do, and so do some host
+    // scanning tools. See the static_assert in PluginProcessor.cpp.
     static constexpr int kCapacity        = 1 << 16;
     static constexpr int kTicksPerQuarter = 960;
     static constexpr int kDrainIntervalMs = 100;
@@ -100,7 +105,9 @@ private:
     };
 
     juce::AbstractFifo    fifo_ { kCapacity };
-    std::array<Event, kCapacity> slots_ {};
+    // Sized once in the constructor and never resized, so indexing it from
+    // push() on the audio thread allocates nothing.
+    std::vector<Event>    slots_;
     std::vector<Event>    events_;
     Drainer               drainer_ { *this };
 
