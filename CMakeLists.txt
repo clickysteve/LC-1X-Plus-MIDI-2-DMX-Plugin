@@ -36,6 +36,7 @@ target_sources(DMXLightController
         Source/PluginProcessor.cpp
         Source/PluginEditor.cpp
         Source/UserProfileStore.cpp
+        Source/ShowRecorder.cpp
 )
 
 # ---------- Include path for our headers ----------

@@ -118,6 +118,10 @@ private:
     juce::TextButton midiOutRefreshBtn{juce::CharPointer_UTF8("\xe2\x86\xbb")};  // ↻
     // Whether the DMX stream also goes down the host's own MIDI chain.
     juce::ToggleButton midiToHostBtn{"To host"};
+    // Live capture: record the emitted DMX stream, write it out as MIDI.
+    juce::TextButton   recBtn{"REC"};
+    juce::Label        recStatus;
+    juce::String       lastRecStatus_;
 
     juce::Label      fixtureLabel{"", "Fixture:"};
     juce::ComboBox   fixtureSelector;
@@ -252,6 +256,8 @@ private:
     void confirmAndDeleteCurrentUserProfile();
     void refreshProfileSelector();
     void updateHostSyncStatus();
+    void updateRecStatus();
+    void saveRecordingAs();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DMXControllerEditor)
 };

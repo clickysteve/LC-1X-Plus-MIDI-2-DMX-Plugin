@@ -1,4 +1,4 @@
-# v1.3.0 — Host Sync fixed, per-fixture FILL, and a menu bar app
+# v1.3.0 — Host Sync fixed, per-fixture FILL, show recording, and a menu bar app
 
 Sessions from any earlier version load unchanged.
 
@@ -87,6 +87,40 @@ The old **Fill** button (which paints the pattern grid) is now labelled
 **Fill Grid**, because having two unrelated things called Fill in the same
 row was confusing. It does exactly what it did before.
 
+## New: record the light show as MIDI
+
+**REC**, next to the MIDI Out selector, captures what the plugin actually
+sends — step advances, flood hits, fills, scene recalls, fader moves, the lot
+— stamped against the musical clock. Stopping offers to save a `.mid` file.
+Drop that onto an External MIDI track pointed at your LC-1X+ and the show
+plays back from the timeline with the plugin doing nothing, and because it's
+ordinary MIDI you can then nudge, trim or redraw any cue in the DAW.
+
+It records the performance, not the sequence. Everything you did by hand
+lands in the file exactly where you did it, which is the part that rendering
+the pattern offline could never reproduce.
+
+Details worth knowing:
+
+- A take always starts at zero, so it can be dropped anywhere on the timeline
+  regardless of where you were when you armed it.
+- The recording opens with the rig's current state, not just what changes
+  afterwards, so anything already lit is in the file.
+- Stopping and restarting the transport mid-take doesn't break it. Every
+  source of musical position rewinds at some point — the MIDI clock counter
+  is zeroed on transport start, the playhead rewinds on a loop — and the take
+  carries on forwards regardless.
+- Position resolution follows the clock: sample-accurate on Host Sync, about
+  20 ms on MIDI Clock, and on the internal clock the gap since the last step
+  is measured so gestures between steps keep their timing.
+- The capture buffer holds about 65,000 events, which is several minutes of a
+  busy show. If it ever fills, the readout says so plainly and saving warns
+  you, rather than letting you discover a silently incomplete take later.
+
+Capture is realtime-safe: the audio thread only writes into a lock-free
+queue, verified by a test that measures zero allocations across 200 blocks
+while recording.
+
 ## New: LC-1X+ Quick Light
 
 A small menu bar app for the case the plugin was never meant to cover:
@@ -109,11 +143,13 @@ It's installed to `/Applications` by the installer alongside the standalone.
 
 ## Tests
 
-The suite grew from 41 cases to 57. New coverage: Host Sync against hosts
+The suite grew from 41 cases to 67. New coverage: Host Sync against hosts
 that report no musical position, no transport state, a free-running engine
 clock, and a zero-length audio buffer; the diagnostics themselves; and
 FILL's interaction with FLOOD, BLACKOUT, a stopped transport, multiple
-fixtures and state persistence.
+fixtures and state persistence; and, for capture, MIDI-file round-tripping,
+FIFO overflow, position sources per clock, opening state, surviving a
+transport restart, and allocation counting while armed.
 
 Two of those are there specifically because the first attempt at this fix
 was wrong. Deriving a position from the timeline looked like a safe

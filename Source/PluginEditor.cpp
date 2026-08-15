@@ -713,6 +713,34 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
         proc.sendMidiToHost.store(midiToHostBtn.getToggleState());
     };
 
+    // ---- Live capture ----
+    // Records what the plugin actually emits — step advances, flood hits,
+    // scene recalls, fader moves — stamped with musical position, and writes
+    // it out as a MIDI file you can drop on an External MIDI track.
+    addAndMakeVisible(recBtn);
+    recBtn.setTooltip(
+        "Record the light show as MIDI.\n\n"
+        "Captures everything the plugin sends while it runs, including live "
+        "flood hits and fader moves, timestamped against the musical clock. "
+        "Stopping offers to save a .mid file: drop that on an External MIDI "
+        "track pointed at your LC-1X+ and the show plays back from the "
+        "timeline with the plugin doing nothing.");
+    recBtn.setColour(TextButton::buttonOnColourId, Theme::RED_ACCENT.darker(0.2f));
+    recBtn.onClick = [this] {
+        if (proc.recorder.isRecording()) {
+            proc.stopRecording();
+            saveRecordingAs();
+        } else {
+            proc.startRecording();
+        }
+        updateRecStatus();
+    };
+
+    addAndMakeVisible(recStatus);
+    recStatus.setFont(juce::FontOptions(11.0f));
+    recStatus.setColour(juce::Label::textColourId, Theme::FG_DIM);
+    updateRecStatus();
+
     addAndMakeVisible(fixtureLabel);
     addAndMakeVisible(fixtureSelector);
     addAndMakeVisible(addFixBtn);
@@ -1547,7 +1575,9 @@ void DMXControllerEditor::resized() {
         midiOutLabel     .setBounds(row.removeFromLeft(60));
         midiOutSelector  .setBounds(row.removeFromLeft(200)); row.removeFromLeft(gap);
         midiOutRefreshBtn.setBounds(row.removeFromLeft(26)); row.removeFromLeft(gap);
-        midiToHostBtn    .setBounds(row.removeFromLeft(90));
+        midiToHostBtn    .setBounds(row.removeFromLeft(90)); row.removeFromLeft(gap);
+        recBtn           .setBounds(row.removeFromLeft(52));  row.removeFromLeft(6);
+        recStatus        .setBounds(row.removeFromLeft(220));
     }
     area.removeFromTop(gap);
 
@@ -1805,6 +1835,7 @@ void DMXControllerEditor::timerCallback() {
     midiLearnBtn.setToggleState(proc.midiLearnActive.load(), dontSendNotification);
 
     updateHostSyncStatus();
+    updateRecStatus();
 
     // Mirror a MIDI-mapped Brightness CC into the slider + grid. The
     // slider's onValueChange writes the same value back to brightnessLive,
@@ -1926,6 +1957,90 @@ void DMXControllerEditor::updateHostSyncStatus() {
         hostSyncStatus.setText(text, juce::dontSendNotification);
         hostSyncStatus.setColour(juce::Label::textColourId, colour);
     }
+}
+
+// ============================================================================
+// Live capture status + save
+// ============================================================================
+void DMXControllerEditor::updateRecStatus() {
+    const bool rec = proc.recorder.isRecording();
+    recBtn.setToggleState(rec, dontSendNotification);
+    recBtn.setButtonText(rec ? "STOP" : "REC");
+
+    juce::String text;
+    juce::Colour colour = Theme::FG_DIM;
+
+    if (rec) {
+        text = "recording  " + juce::String(proc.recorder.eventCount()) + " events";
+        colour = Theme::RED_ACCENT;
+        if (proc.recorder.overflowed()) {
+            text  = "RECORDING OVERFLOWED — take is incomplete";
+            colour = Theme::RED_ACCENT;
+        }
+    } else if (proc.recorder.eventCount() > 0) {
+        text = juce::String(proc.recorder.eventCount()) + " events captured";
+    }
+
+    if (text != lastRecStatus_) {
+        lastRecStatus_ = text;
+        recStatus.setText(text, dontSendNotification);
+        recStatus.setColour(juce::Label::textColourId, colour);
+    }
+}
+
+void DMXControllerEditor::saveRecordingAs() {
+    if (proc.recorder.eventCount() == 0) {
+        juce::NativeMessageBox::showMessageBoxAsync(
+            juce::MessageBoxIconType::InfoIcon, "Nothing recorded",
+            "No DMX was sent while recording, so there's nothing to save.\n\n"
+            "Check that the transport was running and the plugin was "
+            "outputting.");
+        return;
+    }
+
+    if (proc.recorder.overflowed()) {
+        juce::NativeMessageBox::showMessageBoxAsync(
+            juce::MessageBoxIconType::WarningIcon, "Recording overflowed",
+            "The capture buffer filled up, so this take is missing events "
+            "and will not play back correctly.\n\n"
+            "You can still save it, but re-recording a shorter take is "
+            "likely to be more useful.");
+    }
+
+    // Kept alive by the lambda; the chooser is asynchronous.
+    auto chooser = std::make_shared<juce::FileChooser>(
+        "Save light show as MIDI",
+        juce::File::getSpecialLocation(juce::File::userMusicDirectory)
+            .getChildFile("LC-1X show.mid"),
+        "*.mid");
+
+    // The dialog is asynchronous and the host can close this editor while it
+    // is open, so the callback must not assume the editor still exists. It
+    // holds a SafePointer for anything that touches the editor, and reaches
+    // the processor (which outlives us) through a plain reference.
+    juce::Component::SafePointer<DMXControllerEditor> safeThis(this);
+    auto& processor = proc;
+
+    chooser->launchAsync(
+        juce::FileBrowserComponent::saveMode
+            | juce::FileBrowserComponent::canSelectFiles
+            | juce::FileBrowserComponent::warnAboutOverwriting,
+        [safeThis, &processor, chooser](const juce::FileChooser& fc) {
+            const auto file = fc.getResult();
+            if (file == juce::File{}) return;      // cancelled
+
+            if (processor.recorder.writeMidiFile(file)) {
+                // discardRecording() refuses while a take is live, so
+                // re-arming REC while the dialog was open can't wipe it.
+                processor.discardRecording();
+                if (auto* ed = safeThis.getComponent()) ed->updateRecStatus();
+            } else {
+                juce::NativeMessageBox::showMessageBoxAsync(
+                    juce::MessageBoxIconType::WarningIcon, "Couldn't save",
+                    "The MIDI file could not be written to:\n"
+                    + file.getFullPathName());
+            }
+        });
 }
 
 void DMXControllerEditor::refreshPatternSelector() {

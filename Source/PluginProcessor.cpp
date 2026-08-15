@@ -256,6 +256,83 @@ void DMXControllerProcessor::forceRecompute() {
     emitDmxDelta(nullptr, 0);
 }
 
+// ============================================================================
+// Live capture
+// ============================================================================
+double DMXControllerProcessor::captureTimestamp(int sampleOffset) noexcept {
+    const int    src   = clockSource.load();
+    const double srate = sampleRate_ > 0.0 ? sampleRate_ : 44100.0;
+    const double bpmNow = (src == 0 ? bpm.load() : hostBpm.load()) > 0.0
+                        ? (src == 0 ? bpm.load() : hostBpm.load()) : 120.0;
+
+    double raw;
+    if (src == 2 && hostDiagHavePpq.load(std::memory_order_relaxed)) {
+        // Host Sync: the playhead is the authority, refined within the block.
+        raw = hostDiagPpq.load(std::memory_order_relaxed)
+            + ((double)sampleOffset / srate) * bpmNow / 60.0;
+    } else if (src == 1) {
+        // MIDI clock: 24 clocks per quarter note. Exact, ~20 ms resolution at
+        // 120 BPM, and needs nothing from the host.
+        raw = (double)midiClockCount_.load() / 24.0;
+    } else if (src == 0) {
+        // Internal clock: the last step position plus however long ago it
+        // was, so gestures between steps keep their timing.
+        const double sinceStepMs = juce::Time::getMillisecondCounterHiRes()
+                                 - internalStepMs_.load(std::memory_order_relaxed);
+        raw = internalPpq_.load(std::memory_order_relaxed)
+            + juce::jmax(0.0, sinceStepMs) / 1000.0 * bpmNow / 60.0;
+    } else {
+        // Host Sync with no position from the host. There is no musical clock
+        // to speak of — and nothing is stepping either — so hold the take
+        // where it is rather than stamping everything at zero.
+        raw = captureRawLast_;
+    }
+
+    if (!captureRawValid_) {
+        captureRawLast_  = raw;
+        captureBase_     = raw;
+        captureRawValid_ = true;
+    }
+
+    // A rewind (transport restart, loop, counter reset) must not pull the
+    // take backwards; carry the offset forward instead.
+    if (raw < captureRawLast_)
+        captureOffset_ += captureRawLast_ - raw;
+    captureRawLast_ = raw;
+
+    return (raw + captureOffset_) - captureBase_;
+}
+
+void DMXControllerProcessor::startRecording() {
+    const juce::ScopedLock l(dataLock);
+
+    captureRawValid_ = false;
+    captureOffset_   = 0.0;
+
+    // Holding dataLock here matters for more than the fields above: it is
+    // what guarantees no realtime thread is inside recorder.push() while the
+    // FIFO is reset, since every emitDmxDelta() call site holds it too.
+    recorder.start(0.0);
+
+    // Open the take with the state the rig is ACTUALLY in. emitDmxDelta only
+    // sends channels whose value changed, so without this a channel that was
+    // already lit and never changes during the take would be missing from the
+    // recording entirely, and playback would look nothing like the show.
+    outputDesynced_.store(true);
+    computeDmxState(false);
+    emitDmxDelta(nullptr, 0);
+}
+
+void DMXControllerProcessor::stopRecording() {
+    recorder.stop();
+}
+
+void DMXControllerProcessor::discardRecording() {
+    const juce::ScopedLock l(dataLock);
+    if (recorder.isRecording()) return;    // never discard a live take
+    recorder.clear();
+}
+
 PatternBank& DMXControllerProcessor::currentBank() {
     return fixtures[activeFixture].patternBank;
 }
@@ -920,6 +997,21 @@ void DMXControllerProcessor::advanceStep() {
     auto* pat = currentBank().current();
     if (!pat) return;
 
+    // Musical position for capture on the internal clock, which has no other
+    // source of truth. Computed the same way Host Sync computes a step
+    // boundary — odd steps delayed by the swing fraction — so a shuffled show
+    // records as shuffled rather than dead straight.
+    if (pat->subdiv > 0) {
+        ++internalStepCount_;
+        const double sw = (double)swing.load();
+        internalPpq_.store(((double)internalStepCount_
+                            + ((internalStepCount_ & 1) ? sw : 0.0))
+                           / (double)pat->subdiv,
+                           std::memory_order_relaxed);
+        internalStepMs_.store(juce::Time::getMillisecondCounterHiRes(),
+                              std::memory_order_relaxed);
+    }
+
     int newStep = (currentStep.load() + 1) % pat->numSteps;
     currentStep.store(newStep);
     currentBank().currentStep = newStep;
@@ -1134,6 +1226,13 @@ void DMXControllerProcessor::emitDmxDelta(juce::MidiBuffer* buf, int sampleOffse
     juce::MidiBuffer* const hostOut =
         sendMidiToHost.load() ? hostMidiOut_ : nullptr;
 
+    // Musical position for capture, resolved once per pass. hostSamplePos_ is
+    // the offset within the current block when we're inside processBlock and
+    // zero otherwise, so this is sample-accurate under Host Sync and
+    // block-accurate elsewhere.
+    const bool   capturing  = recorder.isRecording();
+    const double capturePpq = capturing ? captureTimestamp(hostSamplePos_) : 0.0;
+
     for (int ch = 0; ch < 128; ch++) {
         const int vel = dmxToVelocity(dmxState_[ch]);
         if (vel == prevDmxState_[ch])
@@ -1150,6 +1249,11 @@ void DMXControllerProcessor::emitDmxDelta(juce::MidiBuffer* buf, int sampleOffse
             if (buf) buf->addEvent(m, sampleOffset);
             if (hostOut) hostOut->addEvent(m, hostSamplePos_);
         }
+
+        // Capture what actually went out, whatever drove it: a step advance,
+        // a flood hit, a scene recall or a fader move. That is the
+        // performance, and it's the part no offline render could reproduce.
+        if (capturing) recorder.push(capturePpq, status, d1, d2);
 
         if (midiSender_ && !midiSender_->push(status, d1, d2)) {
             // Queue full: stop pushing and force a clean resend next time.
@@ -1199,6 +1303,10 @@ void DMXControllerProcessor::pushPreview() {
 // ============================================================================
 void DMXControllerProcessor::startPlayback() {
     sampleCounter_ = 0.0;
+    internalStepCount_ = 0;
+    internalPpq_.store(0.0, std::memory_order_relaxed);
+    internalStepMs_.store(juce::Time::getMillisecondCounterHiRes(),
+                          std::memory_order_relaxed);
 
     isPlaying.store(true);
     if (songModeActive) songPlayer.reset();

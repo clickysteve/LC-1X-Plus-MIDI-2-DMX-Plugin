@@ -273,6 +273,238 @@ public:
 static FillTests fillTests;
 
 // ----------------------------------------------------------------------------
+// Live capture. The value of this feature is that a recording plays back and
+// looks like the performance did, so the things worth testing are that events
+// land at the right musical position, that the take is rebased to zero, and
+// that arming it doesn't cost the audio thread anything.
+// ----------------------------------------------------------------------------
+class RecorderTests : public juce::UnitTest {
+public:
+    RecorderTests() : UnitTest("Show recorder", "processor") {}
+
+    void runTest() override {
+        beginTest("push is ignored until recording starts");
+        {
+            ShowRecorder r;
+            r.push(1.0, 0x90, 0, 100);
+            r.drain();
+            expectEquals(r.eventCount(), 0);
+            expect(!r.isRecording());
+        }
+
+        beginTest("captured events survive the FIFO and keep their order");
+        {
+            ShowRecorder r;
+            r.start(0.0);
+            for (int i = 0; i < 500; ++i)
+                r.push(i * 0.25, 0x90, (juce::uint8)(i % 128), 64);
+            r.stop();
+            expectEquals(r.eventCount(), 500);
+        }
+
+        beginTest("overflow is reported rather than blocking");
+        {
+            ShowRecorder r;
+            r.start(0.0);
+            // Deliberately overrun the FIFO without draining.
+            for (int i = 0; i < (1 << 16) + 1000; ++i)
+                r.push(0.0, 0x90, 0, 64);
+            expect(r.overflowed(), "overflow latched");
+            r.stop();
+        }
+
+        beginTest("a take is rebased so it starts at the top of the file");
+        {
+            // Recording armed at bar 40 must still produce a file that starts
+            // at zero, or it can't be dropped anywhere on the timeline.
+            ShowRecorder r;
+            r.start(160.0);                      // bar 41 in 4/4
+            r.push(160.0, 0x90, 5, 100);
+            r.push(161.0, 0x80, 5, 0);
+            r.stop();
+            expectEquals(r.eventCount(), 2);
+
+            auto tmp = juce::File::createTempFile(".mid");
+            expect(r.writeMidiFile(tmp), "file written");
+
+            juce::FileInputStream in(tmp);
+            juce::MidiFile mf;
+            expect(mf.readFrom(in), "file reads back");
+            expectEquals(mf.getNumTracks(), 1);
+
+            const auto* track = mf.getTrack(0);
+            const double tpq = 960.0;
+            int found = 0;
+            for (int i = 0; i < track->getNumEvents(); ++i) {
+                const auto& m = track->getEventPointer(i)->message;
+                if (m.isNoteOn()) {
+                    expectWithinAbsoluteError(m.getTimeStamp(), 0.0, 1.0,
+                                              "note on rebased to zero");
+                    ++found;
+                } else if (m.isNoteOff()) {
+                    expectWithinAbsoluteError(m.getTimeStamp(), tpq, 1.0,
+                                              "note off one quarter later");
+                    ++found;
+                }
+            }
+            expectEquals(found, 2);
+            tmp.deleteFile();
+        }
+
+        beginTest("writing an empty take fails rather than producing junk");
+        {
+            ShowRecorder r;
+            auto tmp = juce::File::createTempFile(".mid");
+            expect(!r.writeMidiFile(tmp), "refused to write an empty take");
+            tmp.deleteFile();
+        }
+
+        beginTest("MIDI clock drives the captured position");
+        {
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(1);
+            setChasePattern(proc);
+
+            proc.startRecording();
+            // 24 clocks = one quarter note; kClocksPerStep=6 so that's 4 steps.
+            for (int i = 0; i < 4; ++i)
+                runBlock(proc, clockTicks(kClocksPerStep, i == 0));
+            proc.stopRecording();
+
+            expect(proc.recorder.eventCount() > 0, "captured something");
+            // Four steps at a 16th each is one quarter note of material.
+            expectWithinAbsoluteError(proc.recorder.lengthInQuarterNotes(),
+                                      0.75, 0.30,
+                                      "take length tracks the clock");
+        }
+
+        beginTest("host sync stamps the captured position from the playhead");
+        {
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            setChasePattern(proc);
+            ph.playing = true;
+
+            proc.startRecording();
+            // 90 blocks x 512 samples at 120 BPM / 44.1k is 46080 samples,
+            // and a quarter note is 22050 — so just over two quarter notes.
+            const double ppqPerSample = ph.bpm / 60.0 / 44100.0;
+            const double expectedPpq  = ppqPerSample * 512.0 * 90.0;
+            for (int i = 0; i < 90; ++i) {
+                runBlock(proc, {}, 512, i * 512);
+                ph.ppq += ppqPerSample * 512;
+            }
+            proc.stopRecording();
+
+            expect(proc.recorder.eventCount() > 0, "captured something");
+            // The last captured event lands on the final step boundary, which
+            // is up to one step (a 16th, 0.25 quarter notes) before the end.
+            expectWithinAbsoluteError(proc.recorder.lengthInQuarterNotes(),
+                                      expectedPpq, 0.30,
+                                      "take length matches the playhead");
+        }
+
+        beginTest("a take opens with the state the rig is already in");
+        {
+            // emitDmxDelta only sends changed channels. Without a forced
+            // resend at record time, anything already lit and unchanging
+            // would be missing from the file and playback would look wrong.
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0xFF0000);   // rig is lit, static
+
+            proc.startRecording();
+            proc.recorder.drain();
+            proc.stopRecording();
+
+            expect(proc.recorder.eventCount() > 0,
+                   "the already-lit state was captured");
+        }
+
+        beginTest("a transport restart does not collapse the take onto zero");
+        {
+            // Every position source rewinds at some point: the MIDI clock
+            // counter is zeroed on start/stop, the playhead rewinds on a
+            // loop. If the take followed it back, every later event would
+            // land before the take start and be clamped to tick 0 — the whole
+            // show as one simultaneous blob.
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(1);
+            setChasePattern(proc);
+
+            proc.startRecording();
+            for (int i = 0; i < 8; ++i)
+                runBlock(proc, clockTicks(kClocksPerStep, i == 0));
+            proc.recorder.drain();   // no message loop in a headless test
+            const double afterFirstPass = proc.recorder.lengthInQuarterNotes();
+            expect(afterFirstPass > 0.0, "first pass advanced the take");
+
+            // Transport stop and restart zeroes midiClockCount_.
+            runBlock(proc, [] {
+                juce::MidiBuffer b; b.addEvent(juce::MidiMessage::midiStop(), 0); return b;
+            }());
+            for (int i = 0; i < 8; ++i)
+                runBlock(proc, clockTicks(kClocksPerStep, i == 0));
+            proc.stopRecording();
+
+            expect(proc.recorder.lengthInQuarterNotes() >= afterFirstPass,
+                   "the take kept moving forwards across the restart (was "
+                   + juce::String(afterFirstPass) + ", now "
+                   + juce::String(proc.recorder.lengthInQuarterNotes()) + ")");
+        }
+
+        beginTest("arming the recorder does not make the audio thread allocate");
+        {
+            // The whole point of the lock-free FIFO. If this regresses,
+            // recording a show would cause the dropouts 1.2.1 removed.
+            DMXControllerProcessor proc;
+            FakePlayHead ph;
+            proc.setPlayHead(&ph);
+            proc.prepareToPlay(44100.0, 512);
+            proc.clockSource.store(2);
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                proc.fixtures[0].patternBank.patterns[0] = Pattern::rainbow(16, 8);
+                proc.addFixture();
+            }
+            ph.playing = true;
+            proc.startRecording();
+
+            juce::AudioBuffer<float> audio(2, 512);
+            const double ppqPerSample = ph.bpm / 60.0 / 44100.0;
+            juce::MidiBuffer empty;
+
+            for (int i = 0; i < 20; ++i) {          // warm up
+                empty.clear();
+                proc.processBlock(audio, empty);
+                ph.ppq += ppqPerSample * 512;
+            }
+
+            const int before = lc1x::allocCount.load();
+            for (int i = 0; i < 200; ++i) {
+                empty.clear();
+                proc.processBlock(audio, empty);
+                ph.ppq += ppqPerSample * 512;
+            }
+            const int grew = lc1x::allocCount.load() - before;
+            proc.stopRecording();
+
+            expect(grew == 0,
+                   "200 blocks while recording caused " + juce::String(grew)
+                   + " allocations (expected 0)");
+            expect(proc.recorder.eventCount() > 0, "and it actually recorded");
+        }
+    }
+};
+static RecorderTests recorderTests;
+
+// ----------------------------------------------------------------------------
 class MidiClockTests : public juce::UnitTest {
 public:
     MidiClockTests() : UnitTest("MIDI clock stepping", "processor") {}

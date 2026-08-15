@@ -3,6 +3,7 @@
 #include "PatternData.h"
 #include "SongMode.h"
 #include "FixtureProfile.h"
+#include "ShowRecorder.h"
 
 // ============================================================================
 // DMX Controller Audio Processor
@@ -107,6 +108,21 @@ public:
     // Turn it on in hosts where a MIDI effect's output can be routed to a
     // MIDI port (Ableton, Bitwig, Reaper), which is the case it exists for.
     std::atomic<bool> sendMidiToHost {false};
+
+    // ==== Live capture ====
+    // Records the emitted DMX stream, stamped with musical position, so a
+    // performance can be written out as a MIDI file and played back from the
+    // DAW timeline. See ShowRecorder.h.
+    ShowRecorder recorder;
+
+    /// Arm/disarm capture. A take always starts at position zero, so it can
+    /// be dropped anywhere on a timeline. Message thread.
+    void startRecording();
+    void stopRecording();
+
+    /// Throw the current take away. Message thread; safe while recording is
+    /// stopped, and a no-op while it is running.
+    void discardRecording();
 
     // ==== Host Sync diagnostics ====
     // Host Sync is the one clock that depends entirely on the host: it needs
@@ -313,6 +329,34 @@ private:
     // playhead moves it too, so require a short run before believing it.
     int    hostPpqAdvancingBlocks_ = 0;
     static constexpr int kInferPlayingBlocks = 3;
+
+    // ---- Capture timebase ----
+    // Musical position of the internal clock, so a take recorded without any
+    // host or MIDI clock still lands on a grid. Derived from a monotonic step
+    // count so that swing is reflected in the recording exactly as it is
+    // heard — Host Sync folds swing into its step positions, and a recording
+    // that played straight when the show shuffled would be useless.
+    std::atomic<double> internalPpq_     { 0.0 };
+    juce::int64         internalStepCount_ { 0 };
+    // Wall-clock time of the last internal step, so a flood hit or fader move
+    // between steps is stamped where it happened rather than snapping back to
+    // the previous step boundary (a 16th is 125 ms at 120 BPM).
+    std::atomic<double> internalStepMs_  { 0.0 };
+
+    // Every source of musical position can jump backwards: the MIDI clock
+    // counter is zeroed on transport start and stop, the host playhead
+    // rewinds on a loop. A take must only ever move forwards, or events land
+    // before its start and collapse onto tick zero. So the raw position is
+    // tracked and corrected here into a monotonic recording clock.
+    double captureRawLast_  = 0.0;
+    double captureBase_     = 0.0;
+    double captureOffset_   = 0.0;
+    bool   captureRawValid_ = false;
+
+    /// Timestamp for a captured event, in quarter notes from the start of the
+    /// take. Caller must hold dataLock — every emitDmxDelta() call site does,
+    /// which is also what serialises the recorder's single-producer FIFO.
+    double captureTimestamp(int sampleOffset) noexcept;
 
     // --- APVTS plumbing ---
     void parameterChanged(const juce::String& parameterID, float newValue) override;

@@ -8,7 +8,7 @@ reads it from there.
 
 ---
 
-## [1.3.0] — Host Sync fixed, per-fixture FILL, menu bar app
+## [1.3.0] — Host Sync fixed, per-fixture FILL, show recording, menu bar app
 
 Full notes: [RELEASE_NOTES_v1.3.0.md](RELEASE_NOTES_v1.3.0.md)
 
@@ -34,11 +34,18 @@ held across the rig at once. UI and MIDI Learn driven, saved with the
 project. FLOOD still overrides it, BLACKOUT still kills it. The pattern-
 editing button previously called Fill is now Fill Grid.
 
+**Added: live capture.** REC records what the plugin sends — steps, flood
+hits, fills, scene recalls, fader moves — stamped against the musical clock,
+and writes it out as a MIDI file for playback from an External MIDI track.
+Takes start at zero, open with the rig's current state, and survive a
+transport restart. Realtime-safe: the audio thread only writes to a lock-free
+queue, with a test measuring zero allocations while armed.
+
 **Added: LC-1X+ Quick Light**, a menu bar app for turning the rig on
 without opening a DAW. Colour, brightness, MIDI output and a rig setup
 window; shares the plugin's fixture profiles; blacks out on quit.
 
-**Tests** — 41 cases to 57. The Host Sync regression tests fail against
+**Tests** — 41 cases to 67. The Host Sync regression tests fail against
 1.2.1 and pass here, including one that guards against treating the audio
 engine's free-running sample clock as a timeline position.
 

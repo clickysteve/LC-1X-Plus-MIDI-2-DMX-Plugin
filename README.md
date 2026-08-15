@@ -35,6 +35,7 @@ Draw patterns, flood colours, store scenes, and play whole lighting songs — al
 - **Auto-reset on stop** — when the transport stops, patterns snap back to step 1
 - **Three clock sources** — Internal, MIDI Clock, or **Host Sync**
 - **Host-automatable parameters** — Master Dimmer, Hue, Swing, Blackout, Pattern and Flood all appear as automation lanes in your DAW
+- **Record the show** — capture a live performance as a MIDI file and play it back from the DAW timeline without the plugin
 - **MIDI Learn** — map scenes, FLOOD, and transport to hardware controllers
 - **State persistence** — everything saves with your DAW project
 
@@ -56,6 +57,17 @@ host is not processing the plugin, the DAW isn't calling it at all and no
 setting inside the plugin can change that: in Logic, put it in the MIDI FX
 slot of a **Software Instrument** track, which is a track type Logic
 renders.
+
+## Recording a show
+
+**REC** (next to MIDI Out) captures everything the plugin sends, timestamped
+against the musical clock. Stop, save the `.mid`, and drop it onto an
+External MIDI track pointed at your LC-1X+ — the show then plays from the
+timeline with the plugin doing nothing, and every cue is editable like any
+other MIDI.
+
+It captures the performance rather than the sequence: live flood hits, fader
+moves and scene recalls all land where you played them.
 
 ## Quick Light (menu bar app)
 
