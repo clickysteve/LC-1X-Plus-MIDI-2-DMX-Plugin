@@ -14,6 +14,8 @@ constexpr int kMenuOffBase        = 1;      // 1
 constexpr int kMenuColourBase     = 100;    // 100 + colour index
 constexpr int kMenuBrightnessBase = 200;    // 200 + percent/25
 constexpr int kMenuDeviceBase     = 300;    // 300 + device index
+constexpr int kMenuReconnect      = 800;
+constexpr int kMenuOffline        = 801;
 constexpr int kMenuSetupRig       = 900;
 constexpr int kMenuQuit           = 999;
 
@@ -383,7 +385,22 @@ void QuickLightTrayIcon::showMenu() {
     menu.addSeparator();
 
     juce::PopupMenu devices;
-    const auto names = engine_.getOutputDeviceNames();
+    const auto names   = engine_.getOutputDeviceNames();
+    const auto chosen  = engine_.getCurrentDeviceName();
+    const bool linkUp  = engine_.isConnected();
+
+    // Always first, always available. The engine reconnects on its own when
+    // devices come and go, but an endpoint can stop carrying anything with
+    // the device list looking completely unchanged, and when that happens
+    // mid-session you want one obvious thing to click.
+    {
+        juce::PopupMenu::Item item("Reconnect");
+        item.itemID = kMenuReconnect;
+        item.action = act([](QuickLightTrayIcon& s) { s.engine_.reconnect(); });
+        devices.addItem(item);
+    }
+    devices.addSeparator();
+
     if (names.isEmpty()) {
         devices.addItem(-1, "No MIDI outputs found", false, false);
     } else {
@@ -391,13 +408,23 @@ void QuickLightTrayIcon::showMenu() {
             const auto name = names[i];
             juce::PopupMenu::Item item(name);
             item.itemID   = kMenuDeviceBase + i;
-            item.isTicked = (name == engine_.getCurrentDeviceName());
+            item.isTicked = (name == chosen);
             item.action   = act([name](QuickLightTrayIcon& s) {
                                     s.engine_.setOutputDevice(name); });
             devices.addItem(item);
         }
     }
-    menu.addSubMenu("MIDI output", devices);
+
+    // The chosen device isn't in the list: show it anyway, greyed, so it's
+    // clear what's missing rather than the tick simply having vanished.
+    if (chosen.isNotEmpty() && !names.contains(chosen))
+        devices.addItem(kMenuOffline, chosen + " (not connected)", false, true);
+
+    // Say so on the top-level item too, so the state is visible without
+    // opening the submenu.
+    menu.addSubMenu(chosen.isNotEmpty() && !linkUp ? "MIDI output - disconnected"
+                                                   : "MIDI output",
+                    devices);
 
     menu.addItem("Set up rig...", [] {
         QuickLightApplication::get().showRigSetup();

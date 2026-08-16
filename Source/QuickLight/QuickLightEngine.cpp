@@ -14,16 +14,70 @@ static int dmxToVelocity(int dmx) {
     return std::min(127, (dmx + 1) / 2);
 }
 
+// How often the watchdog looks at the connection, and how many of those ticks
+// go by between full refresh sends.
+static constexpr int kWatchdogIntervalMs = 2000;
+static constexpr int kTicksPerRefresh    = 3;      // ~6 seconds
+
 QuickLightEngine::QuickLightEngine() {
     std::fill(std::begin(lastSent_), std::end(lastSent_), -1);
     UserProfileStore::loadOnce();     // user profiles are shared with the plugin
     load();
+
+    // Reopen the moment an interface appears or disappears. Replugging the
+    // LC-1X+, or waking the Mac, hands us a MidiOutput that still looks valid
+    // but no longer reaches anything — this is what catches that.
+    deviceListConnection_ = juce::MidiDeviceListConnection::make(
+        [this] { reconnect(); });
+
+    watchdog_.startTimer(kWatchdogIntervalMs);
 }
 
 QuickLightEngine::~QuickLightEngine() {
+    // Nothing may call back into a half-destroyed engine.
+    deviceListConnection_.reset();
+    watchdog_.stopTimer();
+
     // Never leave the rig lit by a process that no longer exists.
     blackout();
     save();
+}
+
+void QuickLightEngine::Watchdog::timerCallback() {
+    ++ticks;
+    owner.watchdogTick();
+}
+
+void QuickLightEngine::watchdogTick() {
+    // Is the endpoint we hold still one the system knows about?
+    bool stillThere = false;
+    juce::String currentIdForName;
+
+    for (const auto& d : juce::MidiOutput::getAvailableDevices()) {
+        if (d.identifier == identifier_) stillThere = true;
+        if (d.name == deviceName_ && currentIdForName.isEmpty())
+            currentIdForName = d.identifier;
+    }
+
+    const bool wantDevice = deviceName_.isNotEmpty();
+
+    // Reopen when the port we had has gone, when a port under the wanted name
+    // is available and we aren't holding it, or when the name now resolves to
+    // a different identifier than the one we opened.
+    if (wantDevice && (!out_ || !stillThere || currentIdForName != identifier_)) {
+        if (currentIdForName.isNotEmpty() || out_) {
+            openDevice();
+            std::fill(std::begin(lastSent_), std::end(lastSent_), -1);
+            resend();
+        }
+        return;
+    }
+
+    // Otherwise, keep the rig honest with a periodic full refresh.
+    if (out_ && watchdog_.ticks % kTicksPerRefresh == 0) {
+        std::fill(std::begin(lastSent_), std::end(lastSent_), -1);
+        resend();
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -40,24 +94,42 @@ void QuickLightEngine::setOutputDevice(const juce::String& name) {
     // Dark the OLD device before dropping it, without touching on_ — the
     // user asked to change interface, not to turn the lights off, and the
     // new device should come up holding the same look.
-    if (out_) {
+    //
+    // Only when it's actually a different device: re-picking the one already
+    // showing means "reconnect", and blacking out the rig on the way through
+    // would be a nasty surprise mid-set.
+    if (out_ && name != deviceName_) {
         for (int ch = 0; ch < 128; ++ch)
             out_->sendMessageNow(juce::MidiMessage::noteOff(1, ch));
     }
 
-    out_.reset();
     deviceName_ = name;
-
-    for (const auto& d : juce::MidiOutput::getAvailableDevices()) {
-        if (d.name == name) {
-            out_ = juce::MidiOutput::openDevice(d.identifier);
-            break;
-        }
-    }
+    openDevice();
 
     std::fill(std::begin(lastSent_), std::end(lastSent_), -1);   // force a full send
     resend();
     save();
+}
+
+void QuickLightEngine::reconnect() {
+    openDevice();
+    std::fill(std::begin(lastSent_), std::end(lastSent_), -1);
+    resend();
+}
+
+void QuickLightEngine::openDevice() {
+    out_.reset();
+    identifier_ = {};
+
+    if (deviceName_.isEmpty()) return;
+
+    for (const auto& d : juce::MidiOutput::getAvailableDevices()) {
+        if (d.name == deviceName_) {
+            out_ = juce::MidiOutput::openDevice(d.identifier);
+            if (out_) identifier_ = d.identifier;
+            return;
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -208,12 +280,5 @@ void QuickLightEngine::load() {
     }
     if (!loaded.empty()) fixtures_ = std::move(loaded);
 
-    if (deviceName_.isNotEmpty()) {
-        for (const auto& d : juce::MidiOutput::getAvailableDevices()) {
-            if (d.name == deviceName_) {
-                out_ = juce::MidiOutput::openDevice(d.identifier);
-                break;
-            }
-        }
-    }
+    openDevice();
 }

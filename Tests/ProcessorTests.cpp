@@ -1291,3 +1291,98 @@ public:
     }
 };
 static PlaybackBehaviourTests playbackBehaviourTests;
+
+// ----------------------------------------------------------------------------
+// The chosen MIDI device is a *wish*, not a handle. It has to survive the
+// device being absent, because the whole point of the reconnect machinery is
+// that the rig comes back on its own when the interface does. These tests run
+// on machines with no MIDI hardware at all, which is exactly the "device not
+// present" case they need.
+// ----------------------------------------------------------------------------
+class MidiDeviceSelectionTests : public juce::UnitTest {
+public:
+    MidiDeviceSelectionTests() : UnitTest("MIDI device selection", "processor") {}
+
+    // A name no real endpoint will ever have, so this is deterministic even on
+    // a machine that does have MIDI hardware.
+    static juce::String absentName() { return "LC-1X+ Absent Test Device"; }
+
+    void runTest() override {
+        beginTest("a chosen output device is remembered while it is absent");
+        {
+            DMXControllerProcessor proc;
+            proc.setMidiOutputDevice(absentName());
+
+            // Before: the old code cleared the name whenever the open failed,
+            // so the plugin forgot what the user had asked for and could never
+            // pick it up again on its own.
+            expectEquals(proc.getMidiOutputDeviceName(), absentName());
+            expect(!proc.isMidiOutputConnected());
+        }
+
+        beginTest("reconnect keeps the wish and stays disconnected");
+        {
+            DMXControllerProcessor proc;
+            proc.setMidiOutputDevice(absentName());
+            proc.reconnectMidiDevices();
+
+            expectEquals(proc.getMidiOutputDeviceName(), absentName());
+            expect(!proc.isMidiOutputConnected());
+        }
+
+        beginTest("re-picking the same absent device is safe and idempotent");
+        {
+            DMXControllerProcessor proc;
+            proc.setMidiOutputDevice(absentName());
+            for (int i = 0; i < 5; ++i)
+                proc.setMidiOutputDevice(absentName(), true);   // forced reopen
+
+            expectEquals(proc.getMidiOutputDeviceName(), absentName());
+            expect(!proc.isMidiOutputConnected());
+        }
+
+        beginTest("(none) and empty both clear the selection");
+        {
+            DMXControllerProcessor proc;
+
+            proc.setMidiOutputDevice(absentName());
+            proc.setMidiOutputDevice("(none)");
+            expect(proc.getMidiOutputDeviceName().isEmpty());
+
+            proc.setMidiOutputDevice(absentName());
+            proc.setMidiOutputDevice({});
+            expect(proc.getMidiOutputDeviceName().isEmpty());
+        }
+
+        beginTest("the input side behaves the same way");
+        {
+            DMXControllerProcessor proc;
+            proc.setMidiInputDevice(absentName());
+            expectEquals(proc.getMidiInputDeviceName(), absentName());
+            expect(!proc.isMidiInputConnected());
+
+            proc.reconnectMidiDevices();
+            expectEquals(proc.getMidiInputDeviceName(), absentName());
+
+            proc.setMidiInputDevice("(none)");
+            expect(proc.getMidiInputDeviceName().isEmpty());
+        }
+
+        beginTest("an absent device survives a state round-trip");
+        {
+            DMXControllerProcessor a;
+            a.setMidiOutputDevice(absentName());
+
+            juce::MemoryBlock mb;
+            a.getStateInformation(mb);
+
+            DMXControllerProcessor b;
+            b.setStateInformation(mb.getData(), (int)mb.getSize());
+
+            // Reloading a project on a night when the interface isn't plugged
+            // in must not quietly wipe the rig's output setting.
+            expectEquals(b.getMidiOutputDeviceName(), absentName());
+        }
+    }
+};
+static MidiDeviceSelectionTests midiDeviceSelectionTests;

@@ -45,7 +45,20 @@ queue, with a test measuring zero allocations while armed.
 without opening a DAW. Colour, brightness, MIDI output and a rig setup
 window; shares the plugin's fixture profiles; blacks out on quit.
 
-**Tests** — 41 cases to 67. The Host Sync regression tests fail against
+**Fixed: MIDI output silently going deaf.** Unplugging an interface, waking
+the Mac, or anything that makes CoreMIDI re-issue its endpoints left both the
+plugin and Quick Light holding a port that still looked open but carried
+nothing — the fix was to re-pick the device by hand, if you noticed. Both now
+watch the system's MIDI device list and reopen on any change; the chosen
+device is remembered while it's away and reclaimed when it returns, rather
+than being forgotten; Quick Light additionally re-checks every two seconds and
+re-sends the whole rig every six, so a dropped message heals itself. Quick
+Light's MIDI output menu gains a Reconnect item, the plugin's ↻ button now
+reconnects as well as rescans and turns red while the output is down, and a
+device that's chosen but missing is shown as such instead of the selection
+quietly reverting to (none).
+
+**Tests** — 41 cases to 73. The Host Sync regression tests fail against
 1.2.1 and pass here, including one that guards against treating the audio
 engine's free-running sample clock as a timeline position.
 

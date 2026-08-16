@@ -194,10 +194,16 @@ private:
     std::vector<RGBColor> stepClipboard_;
     std::vector<std::vector<RGBColor>> rangeClipboard_;
 
-    // Cached MIDI device lists (refreshed every 2s)
+    // Cached MIDI device lists (refreshed every 2s). These hold the devices
+    // that are actually present, which is not the same as what the processor
+    // has been asked to use — a chosen device can be absent.
     juce::StringArray cachedMidiOutDevices_;
     juce::StringArray cachedMidiInDevices_;
     int refreshCounter_ = 0;
+
+    // Last painted state of the reconnect button, so the indicator only
+    // repaints when the connection state actually flips.
+    bool lastMidiOutOk_ = true;
 
     // Last observed value of proc.sceneLoadBroadcast — when it changes, a
     // scene was loaded via a MIDI mapping and the controls need a refresh.
@@ -247,6 +253,9 @@ private:
     void refreshSubdivSelector();
     void refreshFixtureSelector();
     void refreshMidiDeviceList();
+    /// Repaint the reconnect button to reflect whether the chosen MIDI output
+    /// is actually open. `force` repaints even if the state hasn't changed.
+    void updateMidiOutIndicator(bool force);
     void refreshAll();
     void selectColor(int idx);
     void applyFixtureEdit();

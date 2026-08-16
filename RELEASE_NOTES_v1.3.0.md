@@ -141,15 +141,52 @@ by a process that no longer exists.
 
 It's installed to `/Applications` by the installer alongside the standalone.
 
+## Fixed: MIDI output going quietly deaf
+
+A CoreMIDI endpoint can stop carrying anything without ever reporting an
+error. Unplug and replug the interface, sleep and wake the Mac, or quit
+whatever was publishing a virtual port, and the handle the app is holding
+still looks perfectly valid — it just doesn't reach the rig any more. The
+only clue is that the lights stop responding, and the only cure was to open
+the MIDI output menu and pick the device again.
+
+Both the plugin and Quick Light now listen for changes to the system's MIDI
+device list and reopen their endpoint whenever one happens. The device you
+chose is also treated as a wish rather than a handle: it's remembered while
+it's absent and reclaimed the moment it reappears, instead of being forgotten
+the first time it fails to open. Reopening forces a full re-send of every
+channel, so the rig comes back holding exactly the look it had.
+
+Two things make this recoverable rather than merely automatic, because a
+dead endpoint doesn't always come with a device-list change to notice:
+
+- Quick Light's **MIDI output** submenu has a **Reconnect** item at the top,
+  and says "MIDI output - disconnected" on the parent when the link is down.
+  A watchdog also re-checks the connection every two seconds and re-sends
+  the whole rig every six, which is what real DMX does and means a message
+  lost to a blip heals itself rather than sitting wrong.
+- In the plugin, the **↻** button beside the MIDI Out menu now reconnects as
+  well as rescans, and turns red whenever a device is selected but not open.
+  Re-picking a device from the menu forces a genuine reopen rather than being
+  treated as a no-op.
+
+A device that's chosen but not currently present is now shown as such in both
+apps, rather than the selection silently reverting to (none) — which also
+means loading a project on a night when the rig isn't plugged in no longer
+wipes its output setting.
+
 ## Tests
 
-The suite grew from 41 cases to 67. New coverage: Host Sync against hosts
+The suite grew from 41 cases to 73. New coverage: Host Sync against hosts
 that report no musical position, no transport state, a free-running engine
 clock, and a zero-length audio buffer; the diagnostics themselves; and
 FILL's interaction with FLOOD, BLACKOUT, a stopped transport, multiple
 fixtures and state persistence; and, for capture, MIDI-file round-tripping,
 FIFO overflow, position sources per clock, opening state, surviving a
-transport restart, and allocation counting while armed.
+transport restart, and allocation counting while armed. Six more cover the
+MIDI device selection contract: an absent device stays selected, survives a
+state round-trip, and reports itself disconnected rather than being silently
+dropped.
 
 Two of those are there specifically because the first attempt at this fix
 was wrong. Deriving a position from the timeline looked like a safe

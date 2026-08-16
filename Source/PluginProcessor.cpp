@@ -135,11 +135,37 @@ DMXControllerProcessor::DMXControllerProcessor()
         apvts.addParameterListener(id, this);
 
     midiSender_ = std::make_unique<MidiOutSender>(*this);
+
+    // Notice interfaces coming and going, so a rig that gets unplugged (or a
+    // Mac that sleeps) comes back on its own instead of needing the device
+    // re-picked by hand. Fires on the message thread.
+    //
+    // Registration itself is message-thread-only — JUCE's broadcaster keeps an
+    // unguarded map of callbacks — and hosts are entitled to construct plugins
+    // on a scanning thread, so bounce if we aren't there. The alive flag stops
+    // a queued registration touching a processor that has since gone.
+    auto alive = aliveFlag_;
+    auto listen = [this, alive] {
+        if (! alive->load()) return;
+        midiDeviceListConnection_ = juce::MidiDeviceListConnection::make(
+            [this] { handleMidiDeviceListChange(); });
+    };
+
+    if (juce::MessageManager::existsAndIsCurrentThread())
+        listen();
+    else
+        juce::MessageManager::callAsync(std::move(listen));
 }
 
 DMXControllerProcessor::~DMXControllerProcessor() {
-    // Tell any in-flight delayed preview callback that we're gone.
+    // Tell any in-flight delayed preview callback — and any still-queued
+    // device-list registration from the constructor — that we're gone. This
+    // has to come before the reset below, or a queued registration could slip
+    // in behind it.
     aliveFlag_->store(false);
+
+    // No device-list callback may run into a half-destroyed processor.
+    midiDeviceListConnection_.reset();
 
     for (auto* id : {"masterDim", "hueShift", "swing", "blackout",
                      "floodActive", "floodColor", "pattern"})
@@ -434,25 +460,40 @@ juce::StringArray DMXControllerProcessor::getMidiOutputDeviceNames() {
     return names;
 }
 
-void DMXControllerProcessor::setMidiOutputDevice(const juce::String& name) {
+void DMXControllerProcessor::setMidiOutputDevice(const juce::String& name, bool forceReopen) {
     const juce::ScopedLock l(midiOutLock_);
 
-    // No-op when the requested device is already open. Opening a MIDI
-    // device can be slow, and callers like setStateInformation re-apply
-    // the saved name on every state load.
-    if (name == currentMidiOutName_ && (directMidiOut_ != nullptr || name.isEmpty()))
+    const auto wanted = (name == "(none)") ? juce::String() : name;
+
+    // Cheap path for automatic callers: the device they're asking for is
+    // already open, so there's nothing to do. Opening a MIDI device is slow
+    // and setStateInformation re-applies the saved name on every state load.
+    // A user re-picking the device passes forceReopen and always gets a real
+    // reopen, because "pick it again" is how they tell us it has gone deaf.
+    if (!forceReopen && wanted == currentMidiOutName_
+        && (directMidiOut_ != nullptr || wanted.isEmpty()))
         return;
 
-    directMidiOut_.reset();
-    currentMidiOutName_ = {};
+    // Remember the wanted name even if we can't open it. That's what lets the
+    // device-list callback pick it up again when the interface reappears, and
+    // what keeps the editor's menu showing the user's choice meanwhile.
+    currentMidiOutName_ = wanted;
+    openMidiOutputLocked();
+}
 
-    if (name.isEmpty() || name == "(none)") return;
+void DMXControllerProcessor::openMidiOutputLocked() {
+    directMidiOut_.reset();
+    currentMidiOutIdentifier_ = {};
+    midiOutConnected_.store(false);
+
+    if (currentMidiOutName_.isEmpty()) return;
 
     for (auto& d : juce::MidiOutput::getAvailableDevices()) {
-        if (d.name == name) {
+        if (d.name == currentMidiOutName_) {
             directMidiOut_ = juce::MidiOutput::openDevice(d.identifier);
             if (directMidiOut_) {
-                currentMidiOutName_ = name;
+                currentMidiOutIdentifier_ = d.identifier;
+                midiOutConnected_.store(true);
                 // Force a full resend to the new device. Flagging it (rather
                 // than clearing prevDmxState_ here) keeps that array owned
                 // solely by the dataLock side — this runs under midiOutLock_.
@@ -461,6 +502,36 @@ void DMXControllerProcessor::setMidiOutputDevice(const juce::String& name) {
             return;
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Reconnection
+//
+// A CoreMIDI endpoint can stop carrying anything without the handle ever
+// reporting an error: unplug and replug an interface, sleep and wake the Mac,
+// or quit and relaunch whatever was publishing a virtual port, and the
+// MidiOutput we hold is now addressing an endpoint that no longer exists. The
+// symptom is exactly the one that gets reported — "it just stops, and I have
+// to pick the device again".
+//
+// So on any change to the system's device list we throw the handles away and
+// resolve the wanted names afresh. Reopening is cheap relative to how rarely
+// devices come and go, and re-sending the identical rig state is invisible, so
+// there's nothing to gain by being clever about which change it was.
+// ----------------------------------------------------------------------------
+void DMXControllerProcessor::reconnectMidiDevices() {
+    {
+        const juce::ScopedLock l(midiOutLock_);
+        openMidiOutputLocked();
+    }
+    {
+        const juce::ScopedLock l(midiInLock_);
+        openMidiInputLocked();
+    }
+}
+
+void DMXControllerProcessor::handleMidiDeviceListChange() {
+    reconnectMidiDevices();
 }
 
 // ============================================================================
@@ -473,26 +544,35 @@ juce::StringArray DMXControllerProcessor::getMidiInputDeviceNames() {
     return names;
 }
 
-void DMXControllerProcessor::setMidiInputDevice(const juce::String& name) {
+void DMXControllerProcessor::setMidiInputDevice(const juce::String& name, bool forceReopen) {
     const juce::ScopedLock l(midiInLock_);
 
-    // No-op when the requested device is already open (see note in
-    // setMidiOutputDevice).
-    if (name == currentMidiInName_ && (directMidiIn_ != nullptr || name.isEmpty()))
+    const auto wanted = (name == "(none)") ? juce::String() : name;
+
+    // Same shape as setMidiOutputDevice — see the notes there.
+    if (!forceReopen && wanted == currentMidiInName_
+        && (directMidiIn_ != nullptr || wanted.isEmpty()))
         return;
 
+    currentMidiInName_ = wanted;
+    openMidiInputLocked();
+}
+
+void DMXControllerProcessor::openMidiInputLocked() {
     if (directMidiIn_) directMidiIn_->stop();
     directMidiIn_.reset();
-    currentMidiInName_ = {};
+    currentMidiInIdentifier_ = {};
+    midiInConnected_.store(false);
 
-    if (name.isEmpty() || name == "(none)") return;
+    if (currentMidiInName_.isEmpty()) return;
 
     for (auto& d : juce::MidiInput::getAvailableDevices()) {
-        if (d.name == name) {
+        if (d.name == currentMidiInName_) {
             directMidiIn_ = juce::MidiInput::openDevice(d.identifier, this);
             if (directMidiIn_) {
                 directMidiIn_->start();
-                currentMidiInName_ = name;
+                currentMidiInIdentifier_ = d.identifier;
+                midiInConnected_.store(true);
             }
             return;
         }

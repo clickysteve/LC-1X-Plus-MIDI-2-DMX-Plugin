@@ -676,21 +676,33 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     addAndMakeVisible(midiOutSelector);
     addAndMakeVisible(midiOutRefreshBtn);
 
+    // Picking from these menus always forces a real reopen. Choosing a device
+    // is the user saying "use this one, now" — including when it's the one
+    // already showing, which is what you do when the link has gone quiet.
     midiInSelector.onChange = [this] {
         int id = midiInSelector.getSelectedId();
         if (id == 1)
-            proc.setMidiInputDevice({});
+            proc.setMidiInputDevice({}, true);
         else if (id > 1 && id - 2 < cachedMidiInDevices_.size())
-            proc.setMidiInputDevice(cachedMidiInDevices_[id - 2]);
+            proc.setMidiInputDevice(cachedMidiInDevices_[id - 2], true);
     };
     midiOutSelector.onChange = [this] {
         int id = midiOutSelector.getSelectedId();
         if (id == 1)
-            proc.setMidiOutputDevice({});
+            proc.setMidiOutputDevice({}, true);
         else if (id > 1 && id - 2 < cachedMidiOutDevices_.size())
-            proc.setMidiOutputDevice(cachedMidiOutDevices_[id - 2]);
+            proc.setMidiOutputDevice(cachedMidiOutDevices_[id - 2], true);
     };
-    midiOutRefreshBtn.onClick = [this] { refreshMidiDeviceList(); };
+
+    // A ComboBox only fires onChange when the selection actually changes, so
+    // re-picking the device that's already showing is a no-op and can't be the
+    // recovery path. This button is: it reopens the endpoints unconditionally.
+    midiOutRefreshBtn.setTooltip("Rescan and reconnect MIDI devices");
+    midiOutRefreshBtn.onClick = [this] {
+        proc.reconnectMidiDevices();
+        refreshMidiDeviceList();
+        updateMidiOutIndicator(true);
+    };
 
     // "To host": send the DMX note stream down the host's MIDI chain as well
     // as to the device. Off by default — in Logic the plugin has to sit on a
@@ -1896,14 +1908,38 @@ void DMXControllerEditor::timerCallback() {
         }
     }
 
-    // Refresh the MIDI device lists every ~2 seconds
+    // Refresh the MIDI device lists every ~2 seconds. The connection indicator
+    // rides along here rather than on every tick: getMidiOutputDeviceName()
+    // returns a copy of a String the processor can rewrite from a host thread
+    // during setStateInformation, and there's no reason to widen that window
+    // from twice a second to thirty times a second for an indicator nobody
+    // needs sub-second.
     if (++refreshCounter_ >= 60) {
         refreshCounter_ = 0;
         auto outList = proc.getMidiOutputDeviceNames();
         auto inList  = proc.getMidiInputDeviceNames();
         if (outList != cachedMidiOutDevices_ || inList != cachedMidiInDevices_)
             refreshMidiDeviceList();
+        else
+            updateMidiOutIndicator(false);   // refreshMidiDeviceList does it too
     }
+}
+
+// ----------------------------------------------------------------------------
+// Colour the reconnect button red whenever a device is chosen but not actually
+// open, so a rig that has quietly gone away announces itself instead of being
+// discovered mid-set.
+// ----------------------------------------------------------------------------
+void DMXControllerEditor::updateMidiOutIndicator(bool force) {
+    const bool ok = proc.getMidiOutputDeviceName().isEmpty()
+                    || proc.isMidiOutputConnected();
+    if (!force && ok == lastMidiOutOk_) return;   // repaint only on a change
+    lastMidiOutOk_ = ok;
+
+    midiOutRefreshBtn.setColour(TextButton::buttonColourId,
+                                ok ? Colour(0xff3a3a3a) : Colour(0xff8b2020));
+    midiOutRefreshBtn.setTooltip(ok ? "Rescan and reconnect MIDI devices"
+                                    : "MIDI output disconnected - click to reconnect");
 }
 
 // ============================================================================
@@ -2087,9 +2123,18 @@ void DMXControllerEditor::refreshMidiDeviceList() {
         midiOutSelector.addItem(cachedMidiOutDevices_[i], i + 2);
     if (currentOut.isEmpty()) {
         midiOutSelector.setSelectedId(1, dontSendNotification);
+    } else if (int idx = cachedMidiOutDevices_.indexOf(currentOut); idx >= 0) {
+        midiOutSelector.setSelectedId(idx + 2, dontSendNotification);
     } else {
-        int idx = cachedMidiOutDevices_.indexOf(currentOut);
-        midiOutSelector.setSelectedId(idx >= 0 ? idx + 2 : 1, dontSendNotification);
+        // Chosen but not currently present. Show it as offline rather than
+        // silently snapping the display back to (none): the processor still
+        // wants this device and will grab it the moment it reappears, and the
+        // user needs to see which one is missing. Disabled, because selecting
+        // it would mean nothing.
+        const int offlineId = cachedMidiOutDevices_.size() + 2;
+        midiOutSelector.addItem(currentOut + " (offline)", offlineId);
+        midiOutSelector.setItemEnabled(offlineId, false);
+        midiOutSelector.setSelectedId(offlineId, dontSendNotification);
     }
 
     // Inputs
@@ -2101,10 +2146,16 @@ void DMXControllerEditor::refreshMidiDeviceList() {
         midiInSelector.addItem(cachedMidiInDevices_[i], i + 2);
     if (currentIn.isEmpty()) {
         midiInSelector.setSelectedId(1, dontSendNotification);
+    } else if (int idx = cachedMidiInDevices_.indexOf(currentIn); idx >= 0) {
+        midiInSelector.setSelectedId(idx + 2, dontSendNotification);
     } else {
-        int idx = cachedMidiInDevices_.indexOf(currentIn);
-        midiInSelector.setSelectedId(idx >= 0 ? idx + 2 : 1, dontSendNotification);
+        const int offlineId = cachedMidiInDevices_.size() + 2;
+        midiInSelector.addItem(currentIn + " (offline)", offlineId);
+        midiInSelector.setItemEnabled(offlineId, false);
+        midiInSelector.setSelectedId(offlineId, dontSendNotification);
     }
+
+    updateMidiOutIndicator(true);
 }
 
 void DMXControllerEditor::applyFixtureEdit() {

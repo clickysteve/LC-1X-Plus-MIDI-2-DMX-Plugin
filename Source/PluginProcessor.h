@@ -288,12 +288,33 @@ public:
     // Direct MIDI devices
     // ======================================================================
     juce::StringArray  getMidiOutputDeviceNames();
-    void               setMidiOutputDevice(const juce::String& name);
+
+    /// Choose the output device by name. The name is remembered as the *wanted*
+    /// device even when nothing by that name is currently present, so it can be
+    /// opened later when the interface shows up.
+    ///
+    /// `forceReopen` closes and reopens even when a device of that name is
+    /// already open. That is what a deliberate re-pick from the menu means: the
+    /// user is telling us the connection is dead. Left false for automatic
+    /// callers (state restore) so they stay cheap.
+    void               setMidiOutputDevice(const juce::String& name, bool forceReopen = false);
     juce::String       getMidiOutputDeviceName() const { return currentMidiOutName_; }
+    /// True when the chosen output device is actually open. The name above is
+    /// what the user picked and is remembered even while the device is away,
+    /// so the two can disagree — that's the point.
+    bool               isMidiOutputConnected() const { return midiOutConnected_.load(); }
+
+    /// Re-resolve the chosen MIDI devices against the current device list and
+    /// reopen them. Called automatically when the system's MIDI device list
+    /// changes, and available manually because a CoreMIDI endpoint can go
+    /// stale (sleep/wake, an interface power-cycling) while the device list
+    /// still looks unchanged. Message thread.
+    void reconnectMidiDevices();
 
     juce::StringArray  getMidiInputDeviceNames();
-    void               setMidiInputDevice(const juce::String& name);
+    void               setMidiInputDevice(const juce::String& name, bool forceReopen = false);
     juce::String       getMidiInputDeviceName() const { return currentMidiInName_; }
+    bool               isMidiInputConnected() const { return midiInConnected_.load(); }
 
     void pushPreview();
 
@@ -424,6 +445,18 @@ private:
     juce::CriticalSection             midiOutLock_;
     std::unique_ptr<juce::MidiOutput> directMidiOut_;
     juce::String                      currentMidiOutName_;
+    // The endpoint we actually have open. A device that unplugs and comes
+    // back can be handed a different identifier, and the open handle stops
+    // carrying anything without ever reporting an error — this is what lets
+    // us notice.
+    juce::String                      currentMidiOutIdentifier_;
+    // Lock-free mirror of "directMidiOut_ != nullptr", so the editor can poll
+    // connection state without ever blocking behind an openDevice() call.
+    std::atomic<bool>                 midiOutConnected_ {false};
+
+    /// Resolve currentMidiOutName_ against the live device list and (re)open
+    /// it. midiOutLock_ must already be held.
+    void openMidiOutputLocked();
 
     // ---- Realtime-safe DMX output path ----------------------------------
     // emitDmxDelta() can run on the audio thread (host sync / MIDI clock),
@@ -461,6 +494,17 @@ private:
     juce::CriticalSection             midiInLock_;
     std::unique_ptr<juce::MidiInput>  directMidiIn_;
     juce::String                      currentMidiInName_;
+    juce::String                      currentMidiInIdentifier_;
+    std::atomic<bool>                 midiInConnected_ {false};
+
+    /// As openMidiOutputLocked(), for the input side. midiInLock_ held.
+    void openMidiInputLocked();
+
+    // Fires when MIDI devices are connected or disconnected. Declared after
+    // everything it touches so it is torn down first, and reset explicitly at
+    // the top of the destructor for good measure.
+    juce::MidiDeviceListConnection    midiDeviceListConnection_;
+    void handleMidiDeviceListChange();
 
     // --- HighResolutionTimer ---
     void hiResTimerCallback() override;
