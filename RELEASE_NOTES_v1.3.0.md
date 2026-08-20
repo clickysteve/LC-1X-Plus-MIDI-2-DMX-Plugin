@@ -1,5 +1,11 @@
 # v1.3.0 — Host Sync fixed, per-fixture FILL, show recording, and a menu bar app
 
+Never tagged as its own release; shipped as part of 1.3.1. Two things
+described below were changed by 1.3.1 before either reached anyone: turning
+FILL off releases only the selected fixture, not every fixture, and Quick
+Light does not re-send the rig on a six-second timer. See
+[RELEASE_NOTES_v1.3.1.md](RELEASE_NOTES_v1.3.1.md).
+
 Sessions from any earlier version load unchanged.
 
 ## Fixed: Host Sync
@@ -71,15 +77,8 @@ left bar on red and the right bar on blue at once.
 It works exactly like FLOOD: arm the FILL button, then click a colour and
 that colour is held on the *selected* fixture. Select another fixture, pick
 another colour, and both stay lit. Clicking the same colour again releases
-it. FLOOD still overrides everything while it's up, and BLACKOUT still kills
-the lot.
-
-The FILL button belongs to the fixture you're looking at. It lights up when
-that fixture is filled and follows the fixture selector, so it always shows
-the state of the selected light; turning it off releases that fixture and
-nothing else; and turning it back on restores the colour that fixture had
-before, rather than making you find it again. FLOOD is the one that
-deliberately reaches across the whole rig.
+it, and turning FILL off releases every fixture. FLOOD still overrides
+everything while it's up, and BLACKOUT still kills the lot.
 
 Fills output with the transport stopped and are saved with the project.
 
@@ -148,19 +147,6 @@ by a process that no longer exists.
 
 It's installed to `/Applications` by the installer alongside the standalone.
 
-**Running it alongside the plugin.** The converter is a shared bus, so Quick
-Light is deliberately silent unless it is actually holding the rig. It
-transmits when you ask it to — a colour, a brightness, on or off — and when
-it has to reopen a connection while lit. Switched off it sends nothing at
-all: not on a timer, not when the MIDI device list changes, not when you pick
-a different interface, and not on quit. That means you can leave it in the
-menu bar while you work in the DAW without it stamping on the plugin's show.
-
-If you turn it *on* while the plugin is running, both are driving the same
-universe and they will disagree about the colour. That part is inherent to
-two controllers on one bus, not something the app can arbitrate. Turn Quick
-Light off and the plugin has the rig to itself.
-
 ## Fixed: MIDI output going quietly deaf
 
 A CoreMIDI endpoint can stop carrying anything without ever reporting an
@@ -182,8 +168,9 @@ dead endpoint doesn't always come with a device-list change to notice:
 
 - Quick Light's **MIDI output** submenu has a **Reconnect** item at the top,
   and says "MIDI output - disconnected" on the parent when the link is down.
-  A watchdog also re-checks the endpoint every two seconds, so a missed
-  device-list notification costs a couple of seconds rather than the session.
+  A watchdog also re-checks the connection every two seconds and re-sends
+  the whole rig every six, which is what real DMX does and means a message
+  lost to a blip heals itself rather than sitting wrong.
 - In the plugin, the **↻** button beside the MIDI Out menu now reconnects as
   well as rescans, and turns red whenever a device is selected but not open.
   Re-picking a device from the menu forces a genuine reopen rather than being
@@ -196,7 +183,7 @@ wipes its output setting.
 
 ## Tests
 
-The suite grew from 41 cases to 75. New coverage: Host Sync against hosts
+The suite grew from 41 cases to 73. New coverage: Host Sync against hosts
 that report no musical position, no transport state, a free-running engine
 clock, and a zero-length audio buffer; the diagnostics themselves; and
 FILL's interaction with FLOOD, BLACKOUT, a stopped transport, multiple
@@ -205,9 +192,7 @@ FIFO overflow, position sources per clock, opening state, surviving a
 transport restart, and allocation counting while armed. Six more cover the
 MIDI device selection contract: an absent device stays selected, survives a
 state round-trip, and reports itself disconnected rather than being silently
-dropped. Two more hold FILL to being per-fixture state: releasing one
-fixture's fill leaves the others lit, and a released fill remembers its
-colour for next time.
+dropped.
 
 Two of those are there specifically because the first attempt at this fix
 was wrong. Deriving a position from the timeline looked like a safe
