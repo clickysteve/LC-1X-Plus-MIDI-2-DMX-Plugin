@@ -253,6 +253,9 @@ private:
     void refreshSubdivSelector();
     void refreshFixtureSelector();
     void refreshMidiDeviceList();
+    /// Whether the FILL button should read as on: the selected fixture is
+    /// filled, or fill is armed awaiting a colour.
+    bool fillButtonShouldBeLit() const;
     /// Repaint the reconnect button to reflect whether the chosen MIDI output
     /// is actually open. `force` repaints even if the state hasn't changed.
     void updateMidiOutIndicator(bool force);

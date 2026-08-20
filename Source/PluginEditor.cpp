@@ -1246,14 +1246,14 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
     // what lets one bar sit on red while another sits on blue.
     addAndMakeVisible(fillToggleBtn);
     fillToggleBtn.setClickingTogglesState(true);
-    fillToggleBtn.setTooltip("FILL mode. When ON, clicking a colour button "
-                             "holds THIS fixture on that colour, leaving the "
-                             "others alone — select another fixture and pick a "
-                             "different colour to build up a static look. "
-                             "Click the same colour again to release it. "
-                             "FLOOD overrides every fixture's fill.");
+    fillToggleBtn.setTooltip("FILL for the SELECTED fixture. Turn it on, then "
+                             "click a colour to hold this fixture there; other "
+                             "fixtures keep their own fill, or none. Turning it "
+                             "off releases THIS fixture only. Select another "
+                             "fixture to see and set its fill independently. "
+                             "FLOOD is the rig-wide one and overrides them all.");
     fillToggleBtn.setColour(TextButton::buttonOnColourId, Colour(0xff0070c0));
-    fillToggleBtn.setToggleState(proc.fillMode.load(), dontSendNotification);
+    fillToggleBtn.setToggleState(fillButtonShouldBeLit(), dontSendNotification);
     fillToggleBtn.onClick = [this] {
         const bool on = fillToggleBtn.getToggleState();
         proc.fillMode.store(on);
@@ -1265,13 +1265,29 @@ DMXControllerEditor::DMXControllerEditor(DMXControllerProcessor& p)
             // handler, and a live flood would otherwise keep overriding
             // every fill click — looking like FILL simply didn't work.
             proc.setFloodParams(false, -1);
+
+            // If this fixture already has a colour from earlier, put it back
+            // rather than making the user re-pick it. A packed value of 0 is
+            // black, i.e. nothing worth restoring.
+            uint32_t remembered = 0;
+            {
+                const juce::ScopedLock l(proc.dataLock);
+                const int fi = proc.activeFixture.load();
+                if (fi >= 0 && fi < (int)proc.fixtures.size())
+                    remembered = proc.fixtures[(size_t)fi].fillColor;
+            }
+            if (remembered != 0)
+                proc.setFillForActiveFixture(true, remembered);
         } else {
-            // Leaving fill mode releases every fixture's fill, so the mode
-            // toggle is always a clean way back to the pattern.
-            proc.clearAllFills();
-            grid.repaint();
-            barPreview.repaint();
+            // Releases THIS fixture's fill and nothing else. Fills are
+            // per-fixture state, so the button that shows one fixture's must
+            // not reach across and kill the others — that was the old
+            // behaviour and it made a rig of independent fills impossible to
+            // take apart one light at a time.
+            proc.setFillForActiveFixture(false, 0);
         }
+        grid.repaint();
+        barPreview.repaint();
     };
 
     static const char* sceneLetters[4] = {"A", "B", "C", "D"};
@@ -1875,7 +1891,9 @@ void DMXControllerEditor::timerCallback() {
             autoResetSelector.setSelectedId(wantId, dontSendNotification);
     }
     floodToggleBtn.setToggleState(proc.floodMode.load(), dontSendNotification);
-    fillToggleBtn .setToggleState(proc.fillMode.load(),  dontSendNotification);
+    // Follows the selected fixture, so switching fixtures shows that
+    // fixture's fill rather than a rig-wide mode flag.
+    fillToggleBtn .setToggleState(fillButtonShouldBeLit(), dontSendNotification);
 
     for (int i = 0; i < 4; i++) {
         sceneBtns[i].setColour(TextButton::buttonColourId,
@@ -2111,6 +2129,20 @@ void DMXControllerEditor::refreshFixtureSelector() {
     for (int i = 0; i < (int)proc.fixtures.size(); i++)
         fixtureSelector.addItem(String(proc.fixtures[i].name), i + 1);
     fixtureSelector.setSelectedId(proc.activeFixture + 1, dontSendNotification);
+}
+
+// ----------------------------------------------------------------------------
+// The FILL button is lit when the selected fixture is actually filled, or when
+// fill is armed and waiting for a colour click. Two states, one light: "this
+// fixture is held" and "the next colour you click holds this fixture".
+// ----------------------------------------------------------------------------
+bool DMXControllerEditor::fillButtonShouldBeLit() const {
+    if (proc.fillMode.load()) return true;
+
+    const juce::ScopedLock l(proc.dataLock);
+    const int fi = proc.activeFixture.load();
+    return fi >= 0 && fi < (int)proc.fixtures.size()
+        && proc.fixtures[(size_t)fi].fillActive;
 }
 
 void DMXControllerEditor::refreshMidiDeviceList() {

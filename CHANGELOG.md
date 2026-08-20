@@ -8,6 +8,24 @@ reads it from there.
 
 ---
 
+## [1.3.1] — Quick Light no longer fights the plugin; FILL releases per fixture
+
+Full notes: [RELEASE_NOTES_v1.3.1.md](RELEASE_NOTES_v1.3.1.md)
+
+**Fixed: Quick Light blacked out the plugin's rig every few seconds.** 1.3.0
+gave it a periodic re-send of its own state, which is right for a controller
+that owns the bus and wrong for one sharing a converter with the plugin —
+while switched off, its state is every channel at zero. Quick Light is now
+silent unless it is actually holding the rig, including on device changes and
+on quit. Automatic reconnection is unchanged.
+
+**Fixed: turning FILL off cleared every fixture.** The button now belongs to
+the selected fixture: it follows the fixture selector, releases only that
+fixture, and restores that fixture's previous colour when switched back on.
+FLOOD remains the rig-wide override.
+
+**Tests** — 73 cases to 75.
+
 ## [1.3.0] — Host Sync fixed, per-fixture FILL, show recording, menu bar app
 
 Full notes: [RELEASE_NOTES_v1.3.0.md](RELEASE_NOTES_v1.3.0.md)

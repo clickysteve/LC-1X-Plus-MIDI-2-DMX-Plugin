@@ -90,24 +90,19 @@ private:
     /// touch the look or persist anything.
     void openDevice();
 
-    /// Periodic health check. Two jobs, both aimed at the same complaint —
-    /// "the lights just stop responding until I re-pick the device":
+    /// Periodic connection check, aimed at "the lights stop responding until I
+    /// re-pick the device": verify the endpoint we have open is still in the
+    /// system's device list, and reopen if it isn't. The device-list callback
+    /// should have told us already, but a missed notification costs a whole
+    /// session, and re-enumerating MIDI ports every couple of seconds costs
+    /// nothing in a menu bar app.
     ///
-    ///  1. Verify the endpoint we have open is still in the system's device
-    ///     list, and reopen if it isn't. The device-list callback should have
-    ///     told us already, but a missed notification costs a whole session,
-    ///     and re-enumerating MIDI ports a couple of times a second costs
-    ///     nothing in a menu bar app.
-    ///  2. Periodically re-send every channel, ignoring the lastSent_ cache.
-    ///     Real DMX refreshes continuously for exactly this reason: if a
-    ///     message goes missing, or the converter blinks, the rig heals itself
-    ///     on the next refresh instead of sitting wrong until something else
-    ///     changes.
+    /// It deliberately does NOT re-transmit the look on a schedule. The bus is
+    /// shared with the plugin; see the note above watchdogTick().
     struct Watchdog : juce::Timer {
         explicit Watchdog(QuickLightEngine& e) : owner(e) {}
         void timerCallback() override;
         QuickLightEngine& owner;
-        int ticks = 0;
     };
     void watchdogTick();
 

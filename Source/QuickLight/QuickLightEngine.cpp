@@ -14,10 +14,8 @@ static int dmxToVelocity(int dmx) {
     return std::min(127, (dmx + 1) / 2);
 }
 
-// How often the watchdog looks at the connection, and how many of those ticks
-// go by between full refresh sends.
+// How often the watchdog looks at the connection.
 static constexpr int kWatchdogIntervalMs = 2000;
-static constexpr int kTicksPerRefresh    = 3;      // ~6 seconds
 
 QuickLightEngine::QuickLightEngine() {
     std::fill(std::begin(lastSent_), std::end(lastSent_), -1);
@@ -44,11 +42,27 @@ QuickLightEngine::~QuickLightEngine() {
 }
 
 void QuickLightEngine::Watchdog::timerCallback() {
-    ++ticks;
     owner.watchdogTick();
 }
 
+// ----------------------------------------------------------------------------
+// The watchdog only ever RECONNECTS. It must never re-assert the look on a
+// timer.
+//
+// The DMX bus is shared: the plugin can be driving the same rig through the
+// same converter at the same time. A background app that periodically
+// re-transmits its own state is therefore stamping on whoever else is talking
+// — and when Quick Light is off, "its own state" is all-channels-zero. From
+// the plugin's side that looks exactly like "the lights come on, then go off a
+// few seconds later, every time".
+//
+// So: while Quick Light is off it is silent. It transmits only when the user
+// asks it to (a colour, a brightness, on/off) or when it has to reopen a
+// connection while genuinely holding the rig.
+// ----------------------------------------------------------------------------
 void QuickLightEngine::watchdogTick() {
+    if (deviceName_.isEmpty()) return;
+
     // Is the endpoint we hold still one the system knows about?
     bool stillThere = false;
     juce::String currentIdForName;
@@ -59,25 +73,16 @@ void QuickLightEngine::watchdogTick() {
             currentIdForName = d.identifier;
     }
 
-    const bool wantDevice = deviceName_.isNotEmpty();
-
     // Reopen when the port we had has gone, when a port under the wanted name
     // is available and we aren't holding it, or when the name now resolves to
     // a different identifier than the one we opened.
-    if (wantDevice && (!out_ || !stillThere || currentIdForName != identifier_)) {
-        if (currentIdForName.isNotEmpty() || out_) {
-            openDevice();
-            std::fill(std::begin(lastSent_), std::end(lastSent_), -1);
-            resend();
-        }
-        return;
-    }
+    const bool needsReopen = !out_ || !stillThere || currentIdForName != identifier_;
+    if (! needsReopen) return;
 
-    // Otherwise, keep the rig honest with a periodic full refresh.
-    if (out_ && watchdog_.ticks % kTicksPerRefresh == 0) {
-        std::fill(std::begin(lastSent_), std::end(lastSent_), -1);
-        resend();
-    }
+    // Nothing under that name is present and we hold nothing: just wait.
+    if (currentIdForName.isEmpty() && ! out_) return;
+
+    reconnect();
 }
 
 // ----------------------------------------------------------------------------
@@ -98,7 +103,11 @@ void QuickLightEngine::setOutputDevice(const juce::String& name) {
     // Only when it's actually a different device: re-picking the one already
     // showing means "reconnect", and blacking out the rig on the way through
     // would be a nasty surprise mid-set.
-    if (out_ && name != deviceName_) {
+    //
+    // And only when we're actually holding the rig: if Quick Light is off it
+    // has nothing lit to clear, and firing 128 note-offs at a converter the
+    // plugin might be driving would blank someone else's show.
+    if (out_ && on_ && name != deviceName_) {
         for (int ch = 0; ch < 128; ++ch)
             out_->sendMessageNow(juce::MidiMessage::noteOff(1, ch));
     }
@@ -107,14 +116,17 @@ void QuickLightEngine::setOutputDevice(const juce::String& name) {
     openDevice();
 
     std::fill(std::begin(lastSent_), std::end(lastSent_), -1);   // force a full send
-    resend();
+    if (on_) resend();
     save();
 }
 
 void QuickLightEngine::reconnect() {
     openDevice();
     std::fill(std::begin(lastSent_), std::end(lastSent_), -1);
-    resend();
+
+    // Only re-assert the look if we're the one holding it. While off, staying
+    // silent is the whole point — see the note above watchdogTick().
+    if (on_) resend();
 }
 
 void QuickLightEngine::openDevice() {
@@ -157,6 +169,11 @@ void QuickLightEngine::setOn(bool shouldBeOn) {
 }
 
 void QuickLightEngine::blackout() {
+    // Nothing lit by us means nothing to clear. Sending zeros anyway would
+    // blank a rig the plugin may be driving — including on quit, which is a
+    // horrible way to end someone else's set.
+    if (! on_) return;
+
     on_ = false;
     resend();
 }

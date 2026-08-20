@@ -249,6 +249,42 @@ public:
             expectEquals(redOf(proc, 1), 0);
         }
 
+        beginTest("releasing one fixture's fill leaves the others alone");
+        {
+            // The bug this guards: the FILL button used to clear every
+            // fixture, so taking one light out of a multi-colour static look
+            // blacked out the whole rig.
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.addFixture();
+
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0xFF0000);   // fixture 0 red
+            proc.activeFixture.store(1);
+            proc.setFillForActiveFixture(true, 0xFF0000);   // fixture 1 red
+
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(false, 0);         // release fixture 0
+
+            expectEquals(redOf(proc, 0), 0,   "released fixture went dark");
+            expect(redOf(proc, 1) > 200,      "the other fixture kept its fill");
+        }
+
+        beginTest("a released fill remembers its colour for next time");
+        {
+            // Re-arming FILL puts the previous colour back rather than making
+            // the user hunt for it again, so the button and the light agree.
+            DMXControllerProcessor proc;
+            proc.prepareToPlay(44100.0, 512);
+            proc.activeFixture.store(0);
+            proc.setFillForActiveFixture(true, 0x00FF00);
+            proc.setFillForActiveFixture(false, 0);
+
+            const juce::ScopedLock l(proc.dataLock);
+            expectEquals((int)proc.fixtures[0].fillColor, (int)0x00FF00,
+                         "colour survives release");
+        }
+
         beginTest("fills survive a state round-trip");
         {
             DMXControllerProcessor a, b;
