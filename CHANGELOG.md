@@ -8,24 +8,6 @@ reads it from there.
 
 ---
 
-## [1.3.1] — Quick Light no longer fights the plugin; FILL releases per fixture
-
-Full notes: [RELEASE_NOTES_v1.3.1.md](RELEASE_NOTES_v1.3.1.md)
-
-**Fixed: Quick Light blacked out the plugin's rig every few seconds.** 1.3.0
-gave it a periodic re-send of its own state, which is right for a controller
-that owns the bus and wrong for one sharing a converter with the plugin —
-while switched off, its state is every channel at zero. Quick Light is now
-silent unless it is actually holding the rig, including on device changes and
-on quit. Automatic reconnection is unchanged.
-
-**Fixed: turning FILL off cleared every fixture.** The button now belongs to
-the selected fixture: it follows the fixture selector, releases only that
-fixture, and restores that fixture's previous colour when switched back on.
-FLOOD remains the rig-wide override.
-
-**Tests** — 73 cases to 75.
-
 ## [1.3.0] — Host Sync fixed, per-fixture FILL, show recording, menu bar app
 
 Full notes: [RELEASE_NOTES_v1.3.0.md](RELEASE_NOTES_v1.3.0.md)
@@ -48,9 +30,11 @@ hosts where a MIDI effect's output can be routed to a MIDI port.
 
 **Added: FILL.** FLOOD lights the whole rig one colour; FILL does the same
 to one fixture, and each fixture keeps its own, so several colours can be
-held across the rig at once. UI and MIDI Learn driven, saved with the
-project. FLOOD still overrides it, BLACKOUT still kills it. The pattern-
-editing button previously called Fill is now Fill Grid.
+held across the rig at once. The button belongs to the selected fixture: it
+follows the fixture selector, releases only that fixture, and restores that
+fixture's previous colour when switched back on. UI and MIDI Learn driven,
+saved with the project. FLOOD still overrides it, BLACKOUT still kills it.
+The pattern-editing button previously called Fill is now Fill Grid.
 
 **Added: live capture.** REC records what the plugin sends — steps, flood
 hits, fills, scene recalls, fader moves — stamped against the musical clock,
@@ -69,14 +53,19 @@ plugin and Quick Light holding a port that still looked open but carried
 nothing — the fix was to re-pick the device by hand, if you noticed. Both now
 watch the system's MIDI device list and reopen on any change; the chosen
 device is remembered while it's away and reclaimed when it returns, rather
-than being forgotten; Quick Light additionally re-checks every two seconds and
-re-sends the whole rig every six, so a dropped message heals itself. Quick
-Light's MIDI output menu gains a Reconnect item, the plugin's ↻ button now
-reconnects as well as rescans and turns red while the output is down, and a
-device that's chosen but missing is shown as such instead of the selection
-quietly reverting to (none).
+than being forgotten; Quick Light additionally re-checks its endpoint every
+two seconds. Quick Light's MIDI output menu gains a Reconnect item, the
+plugin's ↻ button now reconnects as well as rescans and turns red while the
+output is down, and a device that's chosen but missing is shown as such
+instead of the selection quietly reverting to (none).
 
-**Tests** — 41 cases to 73. The Host Sync regression tests fail against
+**Note: Quick Light stays silent unless it is holding the rig.** The
+converter is shared with the plugin, so a controller that re-asserts its own
+state on a timer blacks out the other one's show — while Quick Light is
+switched off, its state is every channel at zero. It transmits only when
+asked, and when it has to reopen a connection while lit.
+
+**Tests** — 41 cases to 75. The Host Sync regression tests fail against
 1.2.1 and pass here, including one that guards against treating the audio
 engine's free-running sample clock as a timeline position.
 
